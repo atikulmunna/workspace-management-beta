@@ -1,0 +1,32 @@
+# Source & dev artifacts
+node_modules/
+src/
+*.ts
+!dist/
+
+# Build tooling
+tsconfig.json
+jest.config.ts
+
+# Tests
+src/__tests__/
+
+# Environment
+.env
+.env.*
+
+# Git
+.git/
+.github/
+
+# Docs / internal
+*.md
+workspace-service-srs.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
