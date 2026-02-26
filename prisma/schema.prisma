@@ -1,0 +1,89 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String       @id @default(uuid())
+  email       String       @unique
+  name        String?
+  avatarUrl   String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  memberships     Membership[]
+  invitationsSent Invitation[]     @relation("InvitedBy")
+  magicLinkTokens MagicLinkToken[]
+}
+
+model MagicLinkToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique   // bcrypt hash of the raw token — DB leak safe
+  expiresAt DateTime
+  usedAt    DateTime?           // null = unused, timestamp = consumed
+  createdAt DateTime  @default(now())
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Workspace {
+  id          String       @id @default(uuid())
+  name        String
+  slug        String       @unique
+  description String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  memberships Membership[]
+  invitations Invitation[]
+}
+
+model Membership {
+  id          String    @id @default(uuid())
+  userId      String
+  workspaceId String
+  role        Role      @default(MEMBER)
+  joinedAt    DateTime  @default(now())
+
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workspaceId])
+}
+
+model Invitation {
+  id          String           @id @default(uuid())
+  email       String
+  workspaceId String
+  invitedById String
+  role        Role             @default(MEMBER)
+  status      InvitationStatus @default(PENDING)
+  expiresAt   DateTime
+  createdAt   DateTime         @default(now())
+
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy   User      @relation("InvitedBy", fields: [invitedById], references: [id])
+
+  @@unique([email, workspaceId, status])
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+}
