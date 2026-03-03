@@ -4,6 +4,7 @@ import slugify from 'slugify'
 import { authenticate } from '../../middleware/authenticate'
 import { requireWorkspaceMember, requireRole } from '../../middleware/authorize'
 import { prisma } from '../../lib/prisma'
+import { auditLogOp, AuditAction } from '../../lib/audit'
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors'
 import { StatusCodes } from 'http-status-codes'
 
@@ -161,7 +162,7 @@ router.patch(
       throw new ForbiddenError('Target user is already the owner')
     }
 
-    // Atomic swap: demote caller → ADMIN, promote target → OWNER
+    // Atomic swap: demote caller → ADMIN, promote target → OWNER, log
     const [, updatedTarget] = await prisma.$transaction([
       prisma.membership.update({
         where: { id: callerMem.id },
@@ -172,6 +173,13 @@ router.patch(
         data: { role: 'OWNER' },
         include: { user: { select: { id: true, name: true, email: true } } },
       }),
+      auditLogOp({
+        workspaceId: workspace.id,
+        actorId: caller.id,
+        action: AuditAction.OWNERSHIP_TRANSFERRED,
+        targetId: targetUserId,
+        metadata: { from: caller.id, to: targetUserId },
+      }),
     ])
 
     res.json({
@@ -179,6 +187,32 @@ router.patch(
       newOwner: updatedTarget,
       prevOwner: { ...callerMem, role: 'ADMIN' },
     })
+  }
+)
+
+/**
+ * GET /workspaces/:slug/audit-logs
+ * Returns the audit log for a workspace. ADMIN+ only.
+ * Newest first, max 100 entries (pagination coming later).
+ */
+router.get(
+  '/:slug/audit-logs',
+  requireWorkspaceMember,
+  requireRole('ADMIN'),
+  async (req: Request, res: Response) => {
+    const workspace = await prisma.workspace.findUnique({
+      where: { slug: req.params.slug },
+    })
+    if (!workspace) throw new NotFoundError('Workspace')
+
+    const logs = await prisma.auditLog.findMany({
+      where: { workspaceId: workspace.id },
+      include: { actor: { select: { id: true, name: true, email: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    })
+
+    res.json({ logs })
   }
 )
 

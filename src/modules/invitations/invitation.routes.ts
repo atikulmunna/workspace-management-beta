@@ -3,13 +3,10 @@ import { z } from 'zod'
 import { authenticate } from '../../middleware/authenticate'
 import { requireWorkspaceMember, requireRole } from '../../middleware/authorize'
 import { prisma } from '../../lib/prisma'
+import { auditLogOp, AuditAction } from '../../lib/audit'
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors'
 import { sendInvitationEmail } from '../../lib/email'
 import { StatusCodes } from 'http-status-codes'
-
-// Two routers:
-// 1. Workspace-scoped: /workspaces/:slug/invitations
-// 2. Top-level: /invitations/:id (for accepting)
 
 export const workspaceInvitationRouter = Router({ mergeParams: true })
 export const invitationRouter = Router()
@@ -21,14 +18,13 @@ const inviteSchema = z.object({
   role: z.enum(['ADMIN', 'MEMBER', 'VIEWER']).default('MEMBER'),
 })
 
-// ── Workspace-scoped routes ──────────────────────────────────────────────────
+// ── Workspace-scoped routes ───────────────────────────────────────────────────
 
 workspaceInvitationRouter.use(authenticate)
 workspaceInvitationRouter.use(requireWorkspaceMember)
 
 /**
- * GET /workspaces/:slug/invitations
- * List pending invitations for a workspace. ADMIN+.
+ * GET /workspaces/:slug/invitations — list pending invitations. ADMIN+.
  */
 workspaceInvitationRouter.get(
   '/',
@@ -48,8 +44,8 @@ workspaceInvitationRouter.get(
 )
 
 /**
- * POST /workspaces/:slug/invitations
- * Invite a user by email. ADMIN+.
+ * POST /workspaces/:slug/invitations — invite by email. ADMIN+.
+ * Audit: INVITE_SENT
  */
 workspaceInvitationRouter.post(
   '/',
@@ -61,18 +57,14 @@ workspaceInvitationRouter.post(
     const workspace = await prisma.workspace.findUnique({ where: { slug: req.params.slug } })
     if (!workspace) throw new NotFoundError('Workspace')
 
-    // Check if user is already a member
     const existingMember = await prisma.user.findUnique({
       where: { email },
-      include: {
-        memberships: { where: { workspaceId: workspace.id } },
-      },
+      include: { memberships: { where: { workspaceId: workspace.id } } },
     })
     if (existingMember?.memberships.length) {
       throw new ConflictError('This user is already a member of this workspace')
     }
 
-    // Check for existing pending invitation
     const existingInvitation = await prisma.invitation.findFirst({
       where: { email, workspaceId: workspace.id, status: 'PENDING' },
     })
@@ -80,17 +72,24 @@ workspaceInvitationRouter.post(
       throw new ConflictError('A pending invitation already exists for this email')
     }
 
-    const invitation = await prisma.invitation.create({
-      data: {
-        email,
-        role,
+    const [invitation] = await prisma.$transaction([
+      prisma.invitation.create({
+        data: {
+          email,
+          role,
+          workspaceId: workspace.id,
+          invitedById: user.id,
+          expiresAt: new Date(Date.now() + SEVEN_DAYS),
+        },
+      }),
+      auditLogOp({
         workspaceId: workspace.id,
-        invitedById: user.id,
-        expiresAt: new Date(Date.now() + SEVEN_DAYS),
-      },
-    })
+        actorId: user.id,
+        action: AuditAction.INVITE_SENT,
+        metadata: { email, role },
+      }),
+    ])
 
-    // Send invitation email (non-blocking)
     sendInvitationEmail({
       to: email,
       workspaceName: workspace.name,
@@ -103,8 +102,8 @@ workspaceInvitationRouter.post(
 )
 
 /**
- * DELETE /workspaces/:slug/invitations/:invitationId
- * Revoke a pending invitation. ADMIN+.
+ * DELETE /workspaces/:slug/invitations/:invitationId — revoke. ADMIN+.
+ * Audit: INVITE_REVOKED
  */
 workspaceInvitationRouter.delete(
   '/:invitationId',
@@ -123,21 +122,28 @@ workspaceInvitationRouter.delete(
       throw new ConflictError('Only pending invitations can be revoked')
     }
 
-    await prisma.invitation.update({
-      where: { id: invitationId },
-      data: { status: 'REVOKED' },
-    })
+    await prisma.$transaction([
+      prisma.invitation.update({
+        where: { id: invitationId },
+        data: { status: 'REVOKED' },
+      }),
+      auditLogOp({
+        workspaceId: workspace.id,
+        actorId: req.currentUser!.id,
+        action: AuditAction.INVITE_REVOKED,
+        targetId: invitationId,
+      }),
+    ])
 
     res.status(StatusCodes.NO_CONTENT).send()
   }
 )
 
-// ── Top-level invitation routes ──────────────────────────────────────────────
+// ── Top-level invitation routes ───────────────────────────────────────────────
 
 /**
- * POST /invitations/:id/accept
- * Accept an invitation. User must be authenticated.
- * Their email must match the invitation email.
+ * POST /invitations/:id/accept — accept an invitation.
+ * Audit: INVITE_ACCEPTED + MEMBER_JOINED (same txn)
  */
 invitationRouter.post('/:id/accept', authenticate, async (req: Request, res: Response) => {
   const user = req.currentUser!
@@ -156,23 +162,21 @@ invitationRouter.post('/:id/accept', authenticate, async (req: Request, res: Res
     throw new ForbiddenError('This invitation was not sent to your email address')
   }
 
-  // Create membership + mark invitation accepted (in a transaction)
   const [membership] = await prisma.$transaction([
     prisma.membership.create({
-      data: {
-        userId: user.id,
-        workspaceId: invitation.workspaceId,
-        role: invitation.role,
-      },
+      data: { userId: user.id, workspaceId: invitation.workspaceId, role: invitation.role },
     }),
     prisma.invitation.update({
       where: { id: invitation.id },
       data: { status: 'ACCEPTED' },
     }),
+    auditLogOp({
+      workspaceId: invitation.workspaceId,
+      actorId: user.id,
+      action: AuditAction.INVITE_ACCEPTED,
+      targetId: invitation.id,
+    }),
   ])
 
-  res.status(StatusCodes.CREATED).json({
-    membership,
-    workspace: invitation.workspace,
-  })
+  res.status(StatusCodes.CREATED).json({ membership, workspace: invitation.workspace })
 })

@@ -12,9 +12,17 @@ jest.mock('../lib/prisma', () => ({
             update: jest.fn(),
             updateMany: jest.fn(),
         },
+        refreshToken: {
+            create: jest.fn(),
+            findMany: jest.fn(),
+            update: jest.fn(),
+            updateMany: jest.fn(),
+        },
         $queryRaw: jest.fn(),
+        $transaction: jest.fn(),
     },
 }))
+
 jest.mock('bcrypt', () => ({
     hash: jest.fn().mockResolvedValue('$2b$10$mockedhash'),
     compare: jest.fn(),

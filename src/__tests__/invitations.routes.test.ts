@@ -13,12 +13,21 @@ jest.mock('../lib/prisma', () => ({
             create: jest.fn(),
             update: jest.fn(),
         },
+        auditLog: { create: jest.fn() },
         $transaction: jest.fn(),
         $queryRaw: jest.fn(),
     },
 }))
 jest.mock('../lib/email', () => ({
     sendInvitationEmail: jest.fn().mockResolvedValue(undefined),
+}))
+jest.mock('../lib/audit', () => ({
+    AuditAction: {
+        INVITE_SENT: 'INVITE_SENT',
+        INVITE_ACCEPTED: 'INVITE_ACCEPTED',
+        INVITE_REVOKED: 'INVITE_REVOKED',
+    },
+    auditLogOp: jest.fn().mockReturnValue({ _auditNoop: true }),
 }))
 
 import app from '../app'
@@ -37,26 +46,22 @@ const WS_BASE = '/workspaces/acme-corp/invitations'
 
 // ── POST /workspaces/:slug/invitations ────────────────────────────────────────
 //
-// user.findUnique is called with two DIFFERENT arg shapes during each request:
-//   1. authenticate middleware (syncUser):  { where: { id } }  → adminUser
-//   2. handler member check:               { where: { email } } → depends on test
-//
-// Use mockImplementation to dispatch by argument shape — avoids Once-queue
-// ordering issues while keeping clearMocks: true call-history isolation.
+// POST /invite now goes through $transaction([invitation.create, auditLogOp])
+// so we mock $transaction to return [invitation, {}]
 
 describe('POST /workspaces/:slug/invitations', () => {
     beforeEach(() => {
-        db.workspace.findFirst.mockResolvedValue(workspace)  // requireWorkspaceMember
-        db.membership.findUnique.mockResolvedValue(adminMem) // requireWorkspaceMember role
-        db.workspace.findUnique.mockResolvedValue(workspace) // handler workspace fetch
+        db.workspace.findFirst.mockResolvedValue(workspace)
+        db.membership.findUnique.mockResolvedValue(adminMem)
+        db.workspace.findUnique.mockResolvedValue(workspace)
     })
 
     it('INV-01: ADMIN can send an invitation and returns 201', async () => {
         db.user.findUnique.mockImplementation(({ where }: any) =>
-            Promise.resolve(where.id ? adminUser : null)  // id-lookup → auth; email-lookup → not a member
+            Promise.resolve(where.id ? adminUser : null)
         )
-        db.invitation.findFirst.mockResolvedValue(null)    // no duplicate
-        db.invitation.create.mockResolvedValue(invitation)
+        db.invitation.findFirst.mockResolvedValue(null)
+        db.$transaction.mockResolvedValue([invitation, {}])
 
         const res = await request(app)
             .post(WS_BASE)
@@ -86,7 +91,7 @@ describe('POST /workspaces/:slug/invitations', () => {
         db.user.findUnique.mockImplementation(({ where }: any) =>
             Promise.resolve(where.id ? adminUser : null)
         )
-        db.invitation.findFirst.mockResolvedValue(invitation)  // duplicate found
+        db.invitation.findFirst.mockResolvedValue(invitation)
 
         const res = await request(app)
             .post(WS_BASE)
@@ -108,9 +113,9 @@ describe('DELETE /workspaces/:slug/invitations/:invitationId (revoke)', () => {
         db.workspace.findUnique.mockResolvedValue(workspace)
     })
 
-    it('INV-14: ADMIN can revoke a PENDING invitation → 204', async () => {
-        db.invitation.findFirst.mockResolvedValue(invitation)  // PENDING
-        db.invitation.update.mockResolvedValue({ ...invitation, status: 'REVOKED' })
+    it('INV-14: ADMIN can revoke a PENDING invitation -> 204', async () => {
+        db.invitation.findFirst.mockResolvedValue(invitation)
+        db.$transaction.mockResolvedValue([{ ...invitation, status: 'REVOKED' }, {}])
 
         const res = await request(app)
             .delete(`${WS_BASE}/${invitation.id}`)
@@ -137,10 +142,11 @@ describe('POST /invitations/:id/accept', () => {
     const inviteeToken = makeToken(invitee.id, invitee.email)
     const newMembership = makeMembership({ userId: invitee.id, role: 'MEMBER' })
 
-    it('INV-12: creates membership + marks ACCEPTED atomically → 201', async () => {
+    it('INV-12: creates membership + marks ACCEPTED atomically -> 201', async () => {
         db.user.findUnique.mockResolvedValue(invitee)
         db.invitation.findUnique.mockResolvedValue({ ...invitation, email: invitee.email, workspace })
-        db.$transaction.mockResolvedValue([newMembership, { ...invitation, status: 'ACCEPTED' }])
+        // $transaction returns [membership, updatedInvitation, auditLogEntry]
+        db.$transaction.mockResolvedValue([newMembership, { ...invitation, status: 'ACCEPTED' }, {}])
 
         const res = await request(app)
             .post(`/invitations/${invitation.id}/accept`)
@@ -156,7 +162,7 @@ describe('POST /invitations/:id/accept', () => {
         db.user.findUnique.mockResolvedValue(wrongUser)
         db.invitation.findUnique.mockResolvedValue({
             ...invitation,
-            email: 'bob@example.com',   // different from wrongUser.email
+            email: 'bob@example.com',
             workspace,
         })
 
@@ -172,7 +178,7 @@ describe('POST /invitations/:id/accept', () => {
         db.invitation.findUnique.mockResolvedValue({
             ...invitation,
             email: invitee.email,
-            expiresAt: new Date(Date.now() - 1000),   // already past
+            expiresAt: new Date(Date.now() - 1000),
             workspace,
         })
         db.invitation.update.mockResolvedValue({ ...invitation, status: 'EXPIRED' })

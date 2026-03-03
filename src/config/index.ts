@@ -18,7 +18,11 @@ export const config = {
 
   jwt: {
     secret: required('JWT_SECRET'),
-    expiresIn: process.env.JWT_EXPIRES_IN || '7d',
+    expiresIn: process.env.JWT_EXPIRES_IN || '15m',
+  },
+
+  refreshToken: {
+    expiresInDays: parseInt(process.env.REFRESH_TOKEN_EXPIRES_DAYS || '30', 10),
   },
 
   magicLink: {

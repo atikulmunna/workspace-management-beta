@@ -6,9 +6,14 @@ jest.mock('../lib/prisma', () => ({
         user: { findUnique: jest.fn() },
         workspace: { findFirst: jest.fn(), findUnique: jest.fn(), create: jest.fn(), update: jest.fn(), delete: jest.fn() },
         membership: { findUnique: jest.fn(), findMany: jest.fn(), create: jest.fn(), update: jest.fn() },
+        auditLog: { create: jest.fn(), findMany: jest.fn() },
         $queryRaw: jest.fn(),
         $transaction: jest.fn(),
     },
+}))
+jest.mock('../lib/audit', () => ({
+    AuditAction: { OWNERSHIP_TRANSFERRED: 'OWNERSHIP_TRANSFERRED' },
+    auditLogOp: jest.fn().mockReturnValue({ _auditNoop: true }),
 }))
 
 import app from '../app'
@@ -23,7 +28,6 @@ const owner = makeUser({ id: 'owner-id', email: 'owner@example.com' })
 const ownerMem = makeMembership({ userId: owner.id, role: 'OWNER', workspaceId: workspace.id })
 const ownerToken = makeToken(owner.id, owner.email)
 
-/** Sets up syncUser + requireWorkspaceMember mocks for the owner */
 function authAsOwner() {
     db.user.findUnique.mockResolvedValue(owner)
     db.workspace.findFirst.mockResolvedValue(workspace)
@@ -35,7 +39,7 @@ function authAsOwner() {
 describe('POST /workspaces', () => {
     beforeEach(() => {
         db.user.findUnique.mockResolvedValue(owner)
-        db.workspace.findUnique.mockResolvedValue(null)    // no slug conflict
+        db.workspace.findUnique.mockResolvedValue(null)
         db.workspace.create.mockResolvedValue(workspace)
     })
 
@@ -50,7 +54,7 @@ describe('POST /workspaces', () => {
     })
 
     it('returns 409 when the slug is already taken', async () => {
-        db.workspace.findUnique.mockResolvedValue(workspace)   // slug exists
+        db.workspace.findUnique.mockResolvedValue(workspace)
 
         const res = await request(app)
             .post('/workspaces')
@@ -114,7 +118,7 @@ describe('GET /workspaces/:slug', () => {
     it('WS-09: returns 403 (not 404) when caller is not a member', async () => {
         db.user.findUnique.mockResolvedValue(owner)
         db.workspace.findFirst.mockResolvedValue(workspace)
-        db.membership.findUnique.mockResolvedValue(null)   // not a member
+        db.membership.findUnique.mockResolvedValue(null)
 
         const res = await request(app)
             .get('/workspaces/acme-corp')
@@ -192,20 +196,18 @@ describe('DELETE /workspaces/:slug', () => {
 
 // ── PATCH /workspaces/:slug/transfer-owner ────────────────────────────────────
 //
-// membership.findUnique is called twice in sequence:
+// membership.findUnique is called twice:
 //   1. requireWorkspaceMember: caller's membership lookup
 //   2. handler target lookup:  target member's membership
-// Use mockImplementation to dispatch by userId to avoid Once-queue ordering issues.
+// Use mockImplementation to dispatch by userId.
 
 describe('PATCH /workspaces/:slug/transfer-owner', () => {
-    // UUID-format IDs so Zod z.string().uuid() validation passes
-    const uuidOwner    = makeUser({ id: 'aaaaaaaa-0000-0000-0000-000000000001', email: 'uowner@example.com' })
-    const uuidRecip    = makeUser({ id: 'aaaaaaaa-0000-0000-0000-000000000002', email: 'urecip@example.com' })
+    const uuidOwner = makeUser({ id: 'aaaaaaaa-0000-0000-0000-000000000001', email: 'uowner@example.com' })
+    const uuidRecip = makeUser({ id: 'aaaaaaaa-0000-0000-0000-000000000002', email: 'urecip@example.com' })
     const uuidOwnerMem = makeMembership({ id: 'om-1', userId: uuidOwner.id, role: 'OWNER', workspaceId: workspace.id })
     const uuidRecipMem = makeMembership({ id: 'rm-1', userId: uuidRecip.id, role: 'MEMBER', workspaceId: workspace.id })
     const uuidOwnerToken = makeToken(uuidOwner.id, uuidOwner.email)
 
-    /** Dispatch membership.findUnique by userId */
     function membershipByUserId({ targetMem = uuidRecipMem as any } = {}) {
         db.membership.findUnique.mockImplementation(({ where }: any) => {
             const uid = where?.userId_workspaceId?.userId ?? where?.userId
@@ -220,9 +222,11 @@ describe('PATCH /workspaces/:slug/transfer-owner', () => {
         db.workspace.findFirst.mockResolvedValue(workspace)
         db.workspace.findUnique.mockResolvedValue(workspace)
         membershipByUserId()
+        // $transaction now returns 3 items: [demotedOwner, promotedTarget, auditLog]
         db.$transaction.mockResolvedValue([
             { ...uuidOwnerMem, role: 'ADMIN' },
             { ...uuidRecipMem, role: 'OWNER', user: uuidRecip },
+            {},
         ])
 
         const res = await request(app)
@@ -237,7 +241,7 @@ describe('PATCH /workspaces/:slug/transfer-owner', () => {
 
     it('returns 403 when a non-OWNER (ADMIN) tries to transfer', async () => {
         const adminUser = makeUser({ id: 'aaaaaaaa-0000-0000-0000-000000000003', email: 'uadmin@example.com' })
-        const adminMem  = makeMembership({ userId: adminUser.id, role: 'ADMIN', workspaceId: workspace.id })
+        const adminMem = makeMembership({ userId: adminUser.id, role: 'ADMIN', workspaceId: workspace.id })
         db.user.findUnique.mockResolvedValue(adminUser)
         db.workspace.findFirst.mockResolvedValue(workspace)
         db.membership.findUnique.mockResolvedValue(adminMem)
@@ -254,12 +258,12 @@ describe('PATCH /workspaces/:slug/transfer-owner', () => {
         db.user.findUnique.mockResolvedValue(uuidOwner)
         db.workspace.findFirst.mockResolvedValue(workspace)
         db.workspace.findUnique.mockResolvedValue(workspace)
-        db.membership.findUnique.mockResolvedValue(uuidOwnerMem)  // middleware gets ownerMem
+        db.membership.findUnique.mockResolvedValue(uuidOwnerMem)
 
         const res = await request(app)
             .patch('/workspaces/acme-corp/transfer-owner')
             .set('Authorization', `Bearer ${uuidOwnerToken}`)
-            .send({ userId: uuidOwner.id })   // same as caller, valid UUID -> self-check fires
+            .send({ userId: uuidOwner.id })
 
         expect(res.status).toBe(403)
         expect(res.body.error.message).toMatch(/yourself/)
@@ -294,5 +298,43 @@ describe('PATCH /workspaces/:slug/transfer-owner', () => {
 
         expect(res.status).toBe(422)
         expect(res.body.error.code).toBe('VALIDATION_ERROR')
+    })
+})
+
+// ── GET /workspaces/:slug/audit-logs ─────────────────────────────────────────
+
+describe('GET /workspaces/:slug/audit-logs', () => {
+    it('returns 200 with logs for an ADMIN', async () => {
+        const adminUser = makeUser({ id: 'admin-audit', email: 'audit-admin@example.com' })
+        const adminMem = makeMembership({ userId: adminUser.id, role: 'ADMIN', workspaceId: workspace.id })
+        db.user.findUnique.mockResolvedValue(adminUser)
+        db.workspace.findFirst.mockResolvedValue(workspace)
+        db.membership.findUnique.mockResolvedValue(adminMem)
+        db.workspace.findUnique.mockResolvedValue(workspace)
+        db.auditLog.findMany.mockResolvedValue([
+            { id: 'log-1', action: 'MEMBER_ROLE_CHANGED', actorId: adminUser.id, actor: adminUser, createdAt: new Date() },
+        ])
+
+        const res = await request(app)
+            .get('/workspaces/acme-corp/audit-logs')
+            .set('Authorization', `Bearer ${makeToken(adminUser.id, adminUser.email)}`)
+
+        expect(res.status).toBe(200)
+        expect(res.body.logs).toHaveLength(1)
+        expect(res.body.logs[0].action).toBe('MEMBER_ROLE_CHANGED')
+    })
+
+    it('returns 403 when a MEMBER tries to view audit logs', async () => {
+        const member = makeUser({ id: 'mem-audit', email: 'mem-audit@example.com' })
+        const memberMem = makeMembership({ userId: member.id, role: 'MEMBER', workspaceId: workspace.id })
+        db.user.findUnique.mockResolvedValue(member)
+        db.workspace.findFirst.mockResolvedValue(workspace)
+        db.membership.findUnique.mockResolvedValue(memberMem)
+
+        const res = await request(app)
+            .get('/workspaces/acme-corp/audit-logs')
+            .set('Authorization', `Bearer ${makeToken(member.id, member.email)}`)
+
+        expect(res.status).toBe(403)
     })
 })

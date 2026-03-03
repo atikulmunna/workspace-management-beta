@@ -6,8 +6,18 @@ jest.mock('../lib/prisma', () => ({
         user: { findUnique: jest.fn() },
         workspace: { findFirst: jest.fn(), findUnique: jest.fn() },
         membership: { findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn(), delete: jest.fn() },
+        auditLog: { create: jest.fn() },
         $queryRaw: jest.fn(),
+        $transaction: jest.fn(),
     },
+}))
+// Mock the audit lib so auditLogOp returns a no-op prisma call object
+jest.mock('../lib/audit', () => ({
+    AuditAction: {
+        MEMBER_ROLE_CHANGED: 'MEMBER_ROLE_CHANGED',
+        MEMBER_LEFT: 'MEMBER_LEFT',
+    },
+    auditLogOp: jest.fn().mockReturnValue({ _auditNoop: true }),
 }))
 
 import app from '../app'
@@ -34,11 +44,9 @@ const memberToken = makeToken(memberUser.id, memberUser.email)
 
 const BASE = '/workspaces/acme-corp/members'
 
-/** Sets up middleware mocks for a given caller */
 function authAs(caller: ReturnType<typeof makeUser>, callerMem: ReturnType<typeof makeMembership>) {
     db.user.findUnique.mockResolvedValue(caller)
     db.workspace.findFirst.mockResolvedValue(workspace)
-    // requireWorkspaceMember always calls findUnique for the caller's membership first
     db.membership.findUnique.mockResolvedValueOnce(callerMem)
 }
 
@@ -68,8 +76,9 @@ describe('PATCH /workspaces/:slug/members/:userId (role update)', () => {
     it('allows OWNER to promote a MEMBER to ADMIN', async () => {
         authAs(owner, ownerMem)
         db.workspace.findUnique.mockResolvedValue(workspace)
-        db.membership.findUnique.mockResolvedValueOnce(targetMem)   // target lookup
-        db.membership.update.mockResolvedValue({ ...targetMem, role: 'ADMIN', user: targetUser })
+        db.membership.findUnique.mockResolvedValueOnce(targetMem)
+        const updated = { ...targetMem, role: 'ADMIN', user: targetUser }
+        db.$transaction.mockResolvedValue([updated, {}])
 
         const res = await request(app)
             .patch(`${BASE}/${targetUser.id}`)
@@ -84,7 +93,7 @@ describe('PATCH /workspaces/:slug/members/:userId (role update)', () => {
         authAs(adminUser, adminMem)
         db.workspace.findUnique.mockResolvedValue(workspace)
         db.membership.findUnique.mockResolvedValueOnce(targetMem)
-        db.membership.update.mockResolvedValue({ ...targetMem, role: 'VIEWER', user: targetUser })
+        db.$transaction.mockResolvedValue([{ ...targetMem, role: 'VIEWER', user: targetUser }, {}])
 
         const res = await request(app)
             .patch(`${BASE}/${targetUser.id}`)
@@ -97,7 +106,7 @@ describe('PATCH /workspaces/:slug/members/:userId (role update)', () => {
     it('MEM-05: returns 403 when trying to change the OWNER role', async () => {
         authAs(owner, ownerMem)
         db.workspace.findUnique.mockResolvedValue(workspace)
-        db.membership.findUnique.mockResolvedValueOnce(ownerMem)   // target IS the owner
+        db.membership.findUnique.mockResolvedValueOnce(ownerMem)  // target IS the owner
 
         const res = await request(app)
             .patch(`${BASE}/${owner.id}`)
@@ -114,7 +123,7 @@ describe('PATCH /workspaces/:slug/members/:userId (role update)', () => {
         const res = await request(app)
             .patch(`${BASE}/${targetUser.id}`)
             .set('Authorization', `Bearer ${ownerToken}`)
-            .send({ role: 'OWNER' })   // Zod blocks this
+            .send({ role: 'OWNER' })
 
         expect(res.status).toBe(422)
         expect(res.body.error.code).toBe('VALIDATION_ERROR')
@@ -139,7 +148,7 @@ describe('DELETE /workspaces/:slug/members/:userId (remove member)', () => {
         authAs(adminUser, adminMem)
         db.workspace.findUnique.mockResolvedValue(workspace)
         db.membership.findUnique.mockResolvedValueOnce(targetMem)
-        db.membership.delete.mockResolvedValue(targetMem)
+        db.$transaction.mockResolvedValue([targetMem, {}])
 
         const res = await request(app)
             .delete(`${BASE}/${targetUser.id}`)
@@ -151,8 +160,8 @@ describe('DELETE /workspaces/:slug/members/:userId (remove member)', () => {
     it('allows a MEMBER to remove themselves (self-leave)', async () => {
         authAs(memberUser, memberMem)
         db.workspace.findUnique.mockResolvedValue(workspace)
-        db.membership.findUnique.mockResolvedValueOnce(memberMem)   // target = self
-        db.membership.delete.mockResolvedValue(memberMem)
+        db.membership.findUnique.mockResolvedValueOnce(memberMem)
+        db.$transaction.mockResolvedValue([memberMem, {}])
 
         const res = await request(app)
             .delete(`${BASE}/${memberUser.id}`)
@@ -164,7 +173,7 @@ describe('DELETE /workspaces/:slug/members/:userId (remove member)', () => {
     it('MEM-10: returns 403 when attempting to remove the OWNER', async () => {
         authAs(adminUser, adminMem)
         db.workspace.findUnique.mockResolvedValue(workspace)
-        db.membership.findUnique.mockResolvedValueOnce(ownerMem)   // target is OWNER
+        db.membership.findUnique.mockResolvedValueOnce(ownerMem)
 
         const res = await request(app)
             .delete(`${BASE}/${owner.id}`)

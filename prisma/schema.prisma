@@ -18,6 +18,8 @@ model User {
   memberships     Membership[]
   invitationsSent Invitation[]     @relation("InvitedBy")
   magicLinkTokens MagicLinkToken[]
+  refreshTokens   RefreshToken[]
+  auditLogsActed  AuditLog[]       @relation("AuditActor")
 }
 
 model MagicLinkToken {
@@ -43,6 +45,7 @@ model Workspace {
 
   memberships Membership[]
   invitations Invitation[]
+  auditLogs   AuditLog[]
 }
 
 model Membership {
@@ -86,4 +89,43 @@ enum InvitationStatus {
   ACCEPTED
   EXPIRED
   REVOKED
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique   // bcrypt hash — DB breach cannot expose raw tokens
+  expiresAt DateTime
+  revokedAt DateTime?           // null = active; timestamp = consumed/rotated
+  createdAt DateTime  @default(now())
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model AuditLog {
+  id          String      @id @default(uuid())
+  workspaceId String
+  actorId     String
+  action      AuditAction
+  targetId    String?     // userId, invitationId, etc.
+  metadata    Json?       // { before, after } for role changes; email for invites
+  createdAt   DateTime    @default(now())
+
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  actor       User        @relation("AuditActor", fields: [actorId], references: [id])
+
+  @@index([workspaceId, createdAt(sort: Desc)])
+}
+
+enum AuditAction {
+  MEMBER_JOINED
+  MEMBER_LEFT
+  MEMBER_ROLE_CHANGED
+  INVITE_SENT
+  INVITE_ACCEPTED
+  INVITE_REVOKED
+  WORKSPACE_UPDATED
+  OWNERSHIP_TRANSFERRED
 }

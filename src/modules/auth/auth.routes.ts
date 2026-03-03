@@ -5,7 +5,13 @@ import bcrypt from 'bcrypt'
 import rateLimit from 'express-rate-limit'
 import { prisma } from '../../lib/prisma'
 import { sendMagicLinkEmail } from '../../lib/email'
-import { signToken } from '../../lib/jwt'
+import {
+  signToken,
+  generateRefreshToken,
+  hashRefreshToken,
+  compareRefreshToken,
+  isValidRefreshTokenFormat,
+} from '../../lib/jwt'
 import { authenticate } from '../../middleware/authenticate'
 import { config } from '../../config'
 import { ValidationError, UnauthorizedError } from '../../lib/errors'
@@ -14,8 +20,8 @@ import { StatusCodes } from 'http-status-codes'
 const router = Router()
 
 const BCRYPT_ROUNDS = 10
-const TOKEN_BYTES = 32  // 256 bits of entropy
-const TOKEN_HEX_LENGTH = TOKEN_BYTES * 2  // hex encoding doubles the byte count
+const TOKEN_BYTES = 32
+const TOKEN_HEX_LENGTH = TOKEN_BYTES * 2
 const VALID_TOKEN_RE = /^[0-9a-f]+$/
 
 // SEC-09: max 5 magic-link requests per IP per 15 minutes
@@ -44,28 +50,21 @@ const requestSchema = z.object({
 })
 
 // ── POST /auth/magic-link ─────────────────────────────────────────────────────
-// User submits their email → we generate a token, store its hash, and
-// email them a sign-in link. Always returns 200 to prevent email enumeration.
 router.post('/magic-link', magicLinkLimiter, async (req: Request, res: Response) => {
   const { email, name } = requestSchema.parse(req.body)
 
-  // JIT: create user if they don't exist yet
   const user = await prisma.user.upsert({
     where: { email },
     update: {},
     create: { email, name: name ?? null },
   })
 
-  // Invalidate any previous unused tokens for this user (one active link at a time)
   await prisma.magicLinkToken.updateMany({
     where: { userId: user.id, usedAt: null },
     data: { usedAt: new Date() },
   })
 
-  // Cryptographically secure raw token (never stored)
   const rawToken = crypto.randomBytes(TOKEN_BYTES).toString('hex')
-
-  // Store only the bcrypt hash — DB leak cannot expose valid tokens
   const tokenHash = await bcrypt.hash(rawToken, BCRYPT_ROUNDS)
 
   await prisma.magicLinkToken.create({
@@ -76,44 +75,30 @@ router.post('/magic-link', magicLinkLimiter, async (req: Request, res: Response)
     },
   })
 
-  // Fire-and-forget — a broken SMTP config won't fail the request
   sendMagicLinkEmail({ to: email, token: rawToken }).catch(console.error)
 
-  // Always return 200 regardless of whether the email exists to
-  // prevent attackers from enumerating registered emails
   res.status(StatusCodes.OK).json({
     message: `If an account exists for ${email}, a sign-in link has been sent.`,
   })
 })
 
 // ── GET /auth/verify?token=xxx ────────────────────────────────────────────────
-// User clicks the magic link → validate token hash, issue JWT, consume token.
+// On success: issues a short-lived access token (15m) + rotating refresh token (30d).
 router.get('/verify', verifyLimiter, async (req: Request, res: Response) => {
   const rawToken = req.query.token as string | undefined
   if (!rawToken) throw new ValidationError('Missing token query parameter')
 
-  // Fast-reject obviously invalid tokens before hitting the DB.
-  // A valid token is exactly 64 lowercase hex chars (32 bytes hex-encoded).
-  // This eliminates brute-force probes and malformed inputs with zero DB cost.
   if (rawToken.length !== TOKEN_HEX_LENGTH || !VALID_TOKEN_RE.test(rawToken)) {
     throw new UnauthorizedError('Invalid, expired, or already used sign-in link')
   }
 
-  // Fetch all unexpired, unused tokens. AUTH-04 guarantees at most one active
-  // token per user, so this set is bounded by the number of users who requested
-  // a link in the last 15 min — tiny in practice. The take: 100 is a safety cap.
-  // Future improvement: add a tokenPrefix column to scope this to O(1) lookups.
   const candidates = await prisma.magicLinkToken.findMany({
-    where: {
-      usedAt: null,
-      expiresAt: { gt: new Date() },
-    },
+    where: { usedAt: null, expiresAt: { gt: new Date() } },
     include: { user: true },
     orderBy: { createdAt: 'desc' },
     take: 100,
   })
 
-  // bcrypt.compare finds the matching hash
   let matched: (typeof candidates)[0] | null = null
   for (const candidate of candidates) {
     if (await bcrypt.compare(rawToken, candidate.tokenHash)) {
@@ -126,17 +111,34 @@ router.get('/verify', verifyLimiter, async (req: Request, res: Response) => {
     throw new UnauthorizedError('Invalid, expired, or already used sign-in link')
   }
 
-  // Consume the token — one-time use only
+  // Consume magic-link token
   await prisma.magicLinkToken.update({
     where: { id: matched.id },
     data: { usedAt: new Date() },
   })
 
-  // Issue our own signed JWT
+  // Revoke any existing active refresh tokens for this user (one session at a time)
+  await prisma.refreshToken.updateMany({
+    where: { userId: matched.user.id, revokedAt: null },
+    data: { revokedAt: new Date() },
+  })
+
+  // Issue new refresh token
+  const rawRefresh = generateRefreshToken()
+  const refreshHash = await hashRefreshToken(rawRefresh)
+  await prisma.refreshToken.create({
+    data: {
+      userId: matched.user.id,
+      tokenHash: refreshHash,
+      expiresAt: new Date(Date.now() + config.refreshToken.expiresInDays * 24 * 60 * 60 * 1000),
+    },
+  })
+
   const accessToken = signToken(matched.user.id, matched.user.email)
 
   res.status(StatusCodes.OK).json({
     accessToken,
+    refreshToken: rawRefresh,
     user: {
       id: matched.user.id,
       email: matched.user.email,
@@ -146,13 +148,102 @@ router.get('/verify', verifyLimiter, async (req: Request, res: Response) => {
   })
 })
 
+// ── POST /auth/refresh ────────────────────────────────────────────────────────
+// Client sends their refresh token → gets back a new access + refresh pair.
+// Old refresh token is revoked immediately (rotation).
+const refreshSchema = z.object({
+  refreshToken: z.string(),
+})
+
+router.post('/refresh', async (req: Request, res: Response) => {
+  const { refreshToken: rawRefresh } = refreshSchema.parse(req.body)
+
+  // Fast-reject malformed tokens before hitting DB
+  if (!isValidRefreshTokenFormat(rawRefresh)) {
+    throw new UnauthorizedError('Invalid refresh token')
+  }
+
+  // Find active, unexpired token records — bounded by the take cap
+  const candidates = await prisma.refreshToken.findMany({
+    where: { revokedAt: null, expiresAt: { gt: new Date() } },
+    include: { user: true },
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+  })
+
+  let matched: (typeof candidates)[0] | null = null
+  for (const c of candidates) {
+    if (await compareRefreshToken(rawRefresh, c.tokenHash)) {
+      matched = c
+      break
+    }
+  }
+
+  if (!matched) {
+    throw new UnauthorizedError('Invalid, expired, or revoked refresh token')
+  }
+
+  // Rotate: revoke old token, issue new pair atomically
+  const newRawRefresh = generateRefreshToken()
+  const newRefreshHash = await hashRefreshToken(newRawRefresh)
+  const expiresAt = new Date(Date.now() + config.refreshToken.expiresInDays * 24 * 60 * 60 * 1000)
+
+  await prisma.$transaction([
+    prisma.refreshToken.update({
+      where: { id: matched.id },
+      data: { revokedAt: new Date() },
+    }),
+    prisma.refreshToken.create({
+      data: { userId: matched.user.id, tokenHash: newRefreshHash, expiresAt },
+    }),
+  ])
+
+  const accessToken = signToken(matched.user.id, matched.user.email)
+
+  res.status(StatusCodes.OK).json({
+    accessToken,
+    refreshToken: newRawRefresh,
+  })
+})
+
+// ── POST /auth/logout ─────────────────────────────────────────────────────────
+// Revokes the user's active refresh token. Client should discard stored tokens.
+const logoutSchema = z.object({
+  refreshToken: z.string(),
+})
+
+router.post('/logout', authenticate, async (req: Request, res: Response) => {
+  const { refreshToken: rawRefresh } = logoutSchema.parse(req.body)
+
+  if (!isValidRefreshTokenFormat(rawRefresh)) {
+    // Be silent — don't reveal whether the token was valid
+    return res.status(StatusCodes.NO_CONTENT).send()
+  }
+
+  const candidates = await prisma.refreshToken.findMany({
+    where: { userId: req.currentUser!.id, revokedAt: null },
+    take: 5,  // a user should never have more than a handful of active tokens
+  })
+
+  for (const c of candidates) {
+    if (await compareRefreshToken(rawRefresh, c.tokenHash)) {
+      await prisma.refreshToken.update({
+        where: { id: c.id },
+        data: { revokedAt: new Date() },
+      })
+      break
+    }
+  }
+
+  res.status(StatusCodes.NO_CONTENT).send()
+})
+
 // ── GET /auth/me ──────────────────────────────────────────────────────────────
 router.get('/me', authenticate, (req: Request, res: Response) => {
   res.json({ user: req.currentUser })
 })
 
 // ── PATCH /auth/me ────────────────────────────────────────────────────────────
-// Update the current user's display name or avatar URL.
 const updateProfileSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   avatarUrl: z.string().url().max(2048).optional(),
