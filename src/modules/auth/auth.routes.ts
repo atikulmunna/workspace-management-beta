@@ -14,7 +14,7 @@ import {
 } from '../../lib/jwt'
 import { authenticate } from '../../middleware/authenticate'
 import { config } from '../../config'
-import { ValidationError, UnauthorizedError } from '../../lib/errors'
+import { ValidationError, UnauthorizedError, ConflictError } from '../../lib/errors'
 import { StatusCodes } from 'http-status-codes'
 
 const router = Router()
@@ -24,7 +24,6 @@ const TOKEN_BYTES = 32
 const TOKEN_HEX_LENGTH = TOKEN_BYTES * 2
 const VALID_TOKEN_RE = /^[0-9a-f]+$/
 
-// SEC-09: max 5 magic-link requests per IP per 15 minutes
 const magicLinkLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -34,7 +33,6 @@ const magicLinkLimiter = rateLimit({
   message: { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many sign-in requests. Please wait 15 minutes.' } },
 })
 
-// SEC-10: max 10 verify attempts per IP per 15 minutes
 const verifyLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -83,7 +81,7 @@ router.post('/magic-link', magicLinkLimiter, async (req: Request, res: Response)
 })
 
 // ── GET /auth/verify?token=xxx ────────────────────────────────────────────────
-// On success: issues a short-lived access token (15m) + rotating refresh token (30d).
+// Sets emailVerifiedAt on first successful verification.
 router.get('/verify', verifyLimiter, async (req: Request, res: Response) => {
   const rawToken = req.query.token as string | undefined
   if (!rawToken) throw new ValidationError('Missing token query parameter')
@@ -111,26 +109,35 @@ router.get('/verify', verifyLimiter, async (req: Request, res: Response) => {
     throw new UnauthorizedError('Invalid, expired, or already used sign-in link')
   }
 
-  // Consume magic-link token
+  // Mark token as used + set emailVerifiedAt on first verification
+  const now = new Date()
   await prisma.magicLinkToken.update({
     where: { id: matched.id },
-    data: { usedAt: new Date() },
+    data: { usedAt: now },
   })
 
-  // Revoke any existing active refresh tokens for this user (one session at a time)
+  // Set emailVerifiedAt only on first-ever verification
+  if (!matched.user.emailVerifiedAt) {
+    await prisma.user.update({
+      where: { id: matched.user.id },
+      data: { emailVerifiedAt: now },
+    })
+    matched.user.emailVerifiedAt = now
+  }
+
+  // Revoke existing refresh tokens, issue new pair
   await prisma.refreshToken.updateMany({
     where: { userId: matched.user.id, revokedAt: null },
-    data: { revokedAt: new Date() },
+    data: { revokedAt: now },
   })
 
-  // Issue new refresh token
   const rawRefresh = generateRefreshToken()
   const refreshHash = await hashRefreshToken(rawRefresh)
   await prisma.refreshToken.create({
     data: {
       userId: matched.user.id,
       tokenHash: refreshHash,
-      expiresAt: new Date(Date.now() + config.refreshToken.expiresInDays * 24 * 60 * 60 * 1000),
+      expiresAt: new Date(now.getTime() + config.refreshToken.expiresInDays * 24 * 60 * 60 * 1000),
     },
   })
 
@@ -144,26 +151,21 @@ router.get('/verify', verifyLimiter, async (req: Request, res: Response) => {
       email: matched.user.email,
       name: matched.user.name,
       avatarUrl: matched.user.avatarUrl,
+      emailVerifiedAt: matched.user.emailVerifiedAt,
     },
   })
 })
 
 // ── POST /auth/refresh ────────────────────────────────────────────────────────
-// Client sends their refresh token → gets back a new access + refresh pair.
-// Old refresh token is revoked immediately (rotation).
-const refreshSchema = z.object({
-  refreshToken: z.string(),
-})
+const refreshSchema = z.object({ refreshToken: z.string() })
 
 router.post('/refresh', async (req: Request, res: Response) => {
   const { refreshToken: rawRefresh } = refreshSchema.parse(req.body)
 
-  // Fast-reject malformed tokens before hitting DB
   if (!isValidRefreshTokenFormat(rawRefresh)) {
     throw new UnauthorizedError('Invalid refresh token')
   }
 
-  // Find active, unexpired token records — bounded by the take cap
   const candidates = await prisma.refreshToken.findMany({
     where: { revokedAt: null, expiresAt: { gt: new Date() } },
     include: { user: true },
@@ -183,55 +185,36 @@ router.post('/refresh', async (req: Request, res: Response) => {
     throw new UnauthorizedError('Invalid, expired, or revoked refresh token')
   }
 
-  // Rotate: revoke old token, issue new pair atomically
   const newRawRefresh = generateRefreshToken()
   const newRefreshHash = await hashRefreshToken(newRawRefresh)
   const expiresAt = new Date(Date.now() + config.refreshToken.expiresInDays * 24 * 60 * 60 * 1000)
 
   await prisma.$transaction([
-    prisma.refreshToken.update({
-      where: { id: matched.id },
-      data: { revokedAt: new Date() },
-    }),
-    prisma.refreshToken.create({
-      data: { userId: matched.user.id, tokenHash: newRefreshHash, expiresAt },
-    }),
+    prisma.refreshToken.update({ where: { id: matched.id }, data: { revokedAt: new Date() } }),
+    prisma.refreshToken.create({ data: { userId: matched.user.id, tokenHash: newRefreshHash, expiresAt } }),
   ])
 
   const accessToken = signToken(matched.user.id, matched.user.email)
 
-  res.status(StatusCodes.OK).json({
-    accessToken,
-    refreshToken: newRawRefresh,
-  })
+  res.status(StatusCodes.OK).json({ accessToken, refreshToken: newRawRefresh })
 })
 
 // ── POST /auth/logout ─────────────────────────────────────────────────────────
-// Revokes the user's active refresh token. Client should discard stored tokens.
-const logoutSchema = z.object({
-  refreshToken: z.string(),
-})
+const logoutSchema = z.object({ refreshToken: z.string() })
 
 router.post('/logout', authenticate, async (req: Request, res: Response) => {
   const { refreshToken: rawRefresh } = logoutSchema.parse(req.body)
 
-  if (!isValidRefreshTokenFormat(rawRefresh)) {
-    // Be silent — don't reveal whether the token was valid
-    return res.status(StatusCodes.NO_CONTENT).send()
-  }
-
-  const candidates = await prisma.refreshToken.findMany({
-    where: { userId: req.currentUser!.id, revokedAt: null },
-    take: 5,  // a user should never have more than a handful of active tokens
-  })
-
-  for (const c of candidates) {
-    if (await compareRefreshToken(rawRefresh, c.tokenHash)) {
-      await prisma.refreshToken.update({
-        where: { id: c.id },
-        data: { revokedAt: new Date() },
-      })
-      break
+  if (isValidRefreshTokenFormat(rawRefresh)) {
+    const candidates = await prisma.refreshToken.findMany({
+      where: { userId: req.currentUser!.id, revokedAt: null },
+      take: 5,
+    })
+    for (const c of candidates) {
+      if (await compareRefreshToken(rawRefresh, c.tokenHash)) {
+        await prisma.refreshToken.update({ where: { id: c.id }, data: { revokedAt: new Date() } })
+        break
+      }
     }
   }
 
@@ -259,6 +242,49 @@ router.patch('/me', authenticate, async (req: Request, res: Response) => {
     data: body,
   })
   res.json({ user: updated })
+})
+
+// ── DELETE /auth/me ───────────────────────────────────────────────────────────
+// Deletes the authenticated user's account.
+// Blocked (409) if the user is the sole OWNER of any workspace.
+router.delete('/me', authenticate, async (req: Request, res: Response) => {
+  const userId = req.currentUser!.id
+
+  // Find workspaces where this user is OWNER
+  const ownedMemberships = await prisma.membership.findMany({
+    where: { userId, role: 'OWNER' },
+    include: { workspace: true },
+  })
+
+  // For each owned workspace, check if there are other members who could take over
+  const blockedWorkspaces: string[] = []
+  for (const mem of ownedMemberships) {
+    const otherMemberCount = await prisma.membership.count({
+      where: { workspaceId: mem.workspaceId, userId: { not: userId } },
+    })
+    // Sole occupant OR no other member to transfer to
+    if (otherMemberCount === 0) {
+      blockedWorkspaces.push(mem.workspace.slug)
+    }
+  }
+
+  if (blockedWorkspaces.length > 0) {
+    throw new ConflictError(
+      `You are the sole owner of: ${blockedWorkspaces.join(', ')}. ` +
+      `Transfer ownership or delete these workspaces before deleting your account.`
+    )
+  }
+
+  // Cascade: Prisma schema has onDelete: Cascade on memberships, tokens etc.
+  // Revoke pending invitations sent by this user before cascade delete.
+  await prisma.invitation.updateMany({
+    where: { invitedById: userId, status: 'PENDING' },
+    data: { status: 'REVOKED' },
+  })
+
+  await prisma.user.delete({ where: { id: userId } })
+
+  res.status(StatusCodes.NO_CONTENT).send()
 })
 
 export default router

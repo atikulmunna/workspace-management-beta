@@ -3,8 +3,10 @@ import { z } from 'zod'
 import slugify from 'slugify'
 import { authenticate } from '../../middleware/authenticate'
 import { requireWorkspaceMember, requireRole } from '../../middleware/authorize'
+import { requireVerifiedEmail } from '../../middleware/verifyEmail'
 import { prisma } from '../../lib/prisma'
 import { auditLogOp, AuditAction } from '../../lib/audit'
+import { paginationSchema } from '../../lib/pagination'
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors'
 import { StatusCodes } from 'http-status-codes'
 
@@ -26,9 +28,9 @@ const updateWorkspaceSchema = z.object({
 
 /**
  * POST /workspaces
- * Create a new workspace. Creator becomes OWNER.
+ * Create a new workspace. Requires a verified email. Creator becomes OWNER.
  */
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', requireVerifiedEmail, async (req: Request, res: Response) => {
   const body = createWorkspaceSchema.parse(req.body)
   const user = req.currentUser!
 
@@ -58,24 +60,31 @@ router.post('/', async (req: Request, res: Response) => {
 
 /**
  * GET /workspaces
- * List all workspaces the current user belongs to.
+ * List workspaces the user belongs to (cursor-paginated).
  */
 router.get('/', async (req: Request, res: Response) => {
+  const { limit, cursor } = paginationSchema.parse(req.query)
   const user = req.currentUser!
 
   const memberships = await prisma.membership.findMany({
     where: { userId: user.id },
     include: { workspace: true },
     orderBy: { joinedAt: 'asc' },
+    take: limit + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   })
 
-  const workspaces = memberships.map((m: typeof memberships[number]) => ({
+  const hasNext = memberships.length > limit
+  const page = hasNext ? memberships.slice(0, limit) : memberships
+  const nextCursor = hasNext ? page[page.length - 1]?.id : null
+
+  const workspaces = page.map((m: typeof page[number]) => ({
     ...m.workspace,
     role: m.role,
     joinedAt: m.joinedAt,
   }))
 
-  res.json({ workspaces })
+  res.json({ workspaces, nextCursor })
 })
 
 /**
@@ -191,15 +200,14 @@ router.patch(
 )
 
 /**
- * GET /workspaces/:slug/audit-logs
- * Returns the audit log for a workspace. ADMIN+ only.
- * Newest first, max 100 entries (pagination coming later).
+ * GET /workspaces/:slug/audit-logs — cursor-paginated audit log. ADMIN+ only.
  */
 router.get(
   '/:slug/audit-logs',
   requireWorkspaceMember,
   requireRole('ADMIN'),
   async (req: Request, res: Response) => {
+    const { limit, cursor } = paginationSchema.parse(req.query)
     const workspace = await prisma.workspace.findUnique({
       where: { slug: req.params.slug },
     })
@@ -209,10 +217,15 @@ router.get(
       where: { workspaceId: workspace.id },
       include: { actor: { select: { id: true, name: true, email: true } } },
       orderBy: { createdAt: 'desc' },
-      take: 100,
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     })
 
-    res.json({ logs })
+    const hasNext = logs.length > limit
+    const page = hasNext ? logs.slice(0, limit) : logs
+    const nextCursor = hasNext ? page[page.length - 1]?.id : null
+
+    res.json({ logs: page, nextCursor })
   }
 )
 

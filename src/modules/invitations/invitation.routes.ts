@@ -2,8 +2,10 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { authenticate } from '../../middleware/authenticate'
 import { requireWorkspaceMember, requireRole } from '../../middleware/authorize'
+import { requireVerifiedEmail } from '../../middleware/verifyEmail'
 import { prisma } from '../../lib/prisma'
 import { auditLogOp, AuditAction } from '../../lib/audit'
+import { paginationSchema } from '../../lib/pagination'
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors'
 import { sendInvitationEmail } from '../../lib/email'
 import { StatusCodes } from 'http-status-codes'
@@ -24,12 +26,13 @@ workspaceInvitationRouter.use(authenticate)
 workspaceInvitationRouter.use(requireWorkspaceMember)
 
 /**
- * GET /workspaces/:slug/invitations — list pending invitations. ADMIN+.
+ * GET /workspaces/:slug/invitations — paginated list of pending invitations. ADMIN+.
  */
 workspaceInvitationRouter.get(
   '/',
   requireRole('ADMIN'),
   async (req: Request, res: Response) => {
+    const { limit, cursor } = paginationSchema.parse(req.query)
     const workspace = await prisma.workspace.findUnique({ where: { slug: req.params.slug } })
     if (!workspace) throw new NotFoundError('Workspace')
 
@@ -37,19 +40,26 @@ workspaceInvitationRouter.get(
       where: { workspaceId: workspace.id, status: 'PENDING' },
       include: { invitedBy: { select: { id: true, name: true, email: true } } },
       orderBy: { createdAt: 'desc' },
+      take: limit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     })
 
-    res.json({ invitations })
+    const hasNext = invitations.length > limit
+    const page = hasNext ? invitations.slice(0, limit) : invitations
+    const nextCursor = hasNext ? page[page.length - 1]?.id : null
+
+    res.json({ invitations: page, nextCursor })
   }
 )
 
 /**
- * POST /workspaces/:slug/invitations — invite by email. ADMIN+.
+ * POST /workspaces/:slug/invitations — invite by email. ADMIN+. Requires verified email.
  * Audit: INVITE_SENT
  */
 workspaceInvitationRouter.post(
   '/',
   requireRole('ADMIN'),
+  requireVerifiedEmail,
   async (req: Request, res: Response) => {
     const { email, role } = inviteSchema.parse(req.body)
     const user = req.currentUser!

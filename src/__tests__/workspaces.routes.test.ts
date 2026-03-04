@@ -338,3 +338,54 @@ describe('GET /workspaces/:slug/audit-logs', () => {
         expect(res.status).toBe(403)
     })
 })
+
+// ── Email gate: POST /workspaces blocks unverified users ──────────────────────
+
+describe('Email gate: POST /workspaces', () => {
+    it('returns 403 when user email is not yet verified', async () => {
+        const unverified = makeUser({ id: 'uver-id', email: 'uver@example.com', emailVerifiedAt: null })
+        db.user.findUnique.mockResolvedValue(unverified)
+
+        const res = await request(app)
+            .post('/workspaces')
+            .set('Authorization', `Bearer ${makeToken(unverified.id, unverified.email)}`)
+            .send({ name: 'Secret Corp' })
+
+        expect(res.status).toBe(403)
+        expect(res.body.error.message).toMatch(/Email not verified/)
+    })
+})
+
+// ── Pagination: GET /workspaces ────────────────────────────────────────────────
+
+describe('Pagination: GET /workspaces', () => {
+    it('returns nextCursor when there are more results than the limit', async () => {
+        db.user.findUnique.mockResolvedValue(owner)
+        // Simulate 3 memberships returned when limit=2 (limit+1 is fetched)
+        const mem1 = { ...makeMembership({ id: 'mem-1', workspaceId: 'ws-1' }), workspace: makeWorkspace({ id: 'ws-1', slug: 'ws-one' }) }
+        const mem2 = { ...makeMembership({ id: 'mem-2', workspaceId: 'ws-2' }), workspace: makeWorkspace({ id: 'ws-2', slug: 'ws-two' }) }
+        const mem3 = { ...makeMembership({ id: 'mem-3', workspaceId: 'ws-3' }), workspace: makeWorkspace({ id: 'ws-3', slug: 'ws-three' }) }
+        db.membership.findMany.mockResolvedValue([mem1, mem2, mem3])
+
+        const res = await request(app)
+            .get('/workspaces?limit=2')
+            .set('Authorization', `Bearer ${ownerToken}`)
+
+        expect(res.status).toBe(200)
+        expect(res.body.workspaces).toHaveLength(2)
+        expect(res.body.nextCursor).toBe('mem-2')
+    })
+
+    it('returns nextCursor=null when all results fit in one page', async () => {
+        db.user.findUnique.mockResolvedValue(owner)
+        const mem1 = { ...makeMembership({ id: 'mem-1' }), workspace }
+        db.membership.findMany.mockResolvedValue([mem1])
+
+        const res = await request(app)
+            .get('/workspaces?limit=20')
+            .set('Authorization', `Bearer ${ownerToken}`)
+
+        expect(res.status).toBe(200)
+        expect(res.body.nextCursor).toBeNull()
+    })
+})

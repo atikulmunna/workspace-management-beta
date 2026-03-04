@@ -193,3 +193,25 @@ describe('POST /invitations/:id/accept', () => {
         )
     })
 })
+
+// ── Email gate: POST /workspaces/:slug/invitations ────────────────────────────
+
+describe('Email gate: POST /workspaces/:slug/invitations', () => {
+    it('returns 403 when ADMIN email is not yet verified', async () => {
+        const unverifiedAdmin = makeUser({ id: 'uver-admin', email: 'uver-admin@example.com', emailVerifiedAt: null })
+        const unverifiedAdminMem = makeMembership({ userId: unverifiedAdmin.id, role: 'ADMIN', workspaceId: workspace.id })
+
+        db.user.findUnique.mockResolvedValue(unverifiedAdmin)
+        db.workspace.findFirst.mockResolvedValue(workspace)
+        db.membership.findUnique.mockResolvedValue(unverifiedAdminMem)
+        db.workspace.findUnique.mockResolvedValue(workspace)
+
+        const res = await request(app)
+            .post(WS_BASE)
+            .set('Authorization', `Bearer ${makeToken(unverifiedAdmin.id, unverifiedAdmin.email)}`)
+            .send({ email: 'bob@example.com', role: 'MEMBER' })
+
+        expect(res.status).toBe(403)
+        expect(res.body.error.message).toMatch(/Email not verified/)
+    })
+})

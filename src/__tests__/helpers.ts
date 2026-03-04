@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken'
 type Role = 'OWNER' | 'ADMIN' | 'MEMBER' | 'VIEWER'
 type InvitationStatus = 'PENDING' | 'ACCEPTED' | 'EXPIRED' | 'REVOKED'
 
-interface User { id: string; email: string; name: string | null; avatarUrl: string | null; createdAt: Date; updatedAt: Date }
+interface User { id: string; email: string; name: string | null; avatarUrl: string | null; emailVerifiedAt: Date | null; createdAt: Date; updatedAt: Date }
 interface Workspace { id: string; name: string; slug: string; description: string | null; createdAt: Date; updatedAt: Date }
 interface Membership { id: string; userId: string; workspaceId: string; role: Role; joinedAt: Date }
 interface Invitation { id: string; email: string; workspaceId: string; invitedById: string; role: Role; status: InvitationStatus; expiresAt: Date; createdAt: Date }
@@ -27,6 +27,7 @@ export function makeUser(overrides: Partial<User> = {}): User {
         email: 'alice@example.com',
         name: 'Alice',
         avatarUrl: null,
+        emailVerifiedAt: new Date('2024-01-01'),   // verified by default
         createdAt: new Date('2024-01-01'),
         updatedAt: new Date('2024-01-01'),
         ...overrides,

@@ -5,6 +5,7 @@ import { authenticate } from '../../middleware/authenticate'
 import { requireWorkspaceMember, requireRole } from '../../middleware/authorize'
 import { prisma } from '../../lib/prisma'
 import { auditLogOp, AuditAction } from '../../lib/audit'
+import { paginationSchema } from '../../lib/pagination'
 import { ForbiddenError, NotFoundError } from '../../lib/errors'
 import { StatusCodes } from 'http-status-codes'
 
@@ -20,9 +21,10 @@ const updateRoleSchema = z.object({
 })
 
 /**
- * GET /workspaces/:slug/members
+ * GET /workspaces/:slug/members — cursor-paginated member list.
  */
 router.get('/', async (req: Request, res: Response) => {
+  const { limit, cursor } = paginationSchema.parse(req.query)
   const workspace = await prisma.workspace.findUnique({
     where: { slug: req.params.slug },
   })
@@ -32,9 +34,15 @@ router.get('/', async (req: Request, res: Response) => {
     where: { workspaceId: workspace.id },
     include: { user: { select: { id: true, name: true, email: true, avatarUrl: true } } },
     orderBy: { joinedAt: 'asc' },
+    take: limit + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   })
 
-  res.json({ members })
+  const hasNext = members.length > limit
+  const page = hasNext ? members.slice(0, limit) : members
+  const nextCursor = hasNext ? page[page.length - 1]?.id : null
+
+  res.json({ members: page, nextCursor })
 })
 
 /**
