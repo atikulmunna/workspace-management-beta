@@ -30,11 +30,11 @@ export const config = {
   },
 
   email: {
-    host: process.env.SMTP_HOST || '',
-    port: parseInt(process.env.SMTP_PORT || '587', 10),
-    user: process.env.SMTP_USER || '',
+    host: process.env.SMTP_HOST || 'smtp.resend.com',
+    port: parseInt(process.env.SMTP_PORT || '465', 10),
+    user: process.env.SMTP_USER || 'resend',
     pass: process.env.SMTP_PASS || '',
-    from: process.env.EMAIL_FROM || 'noreply@yourapp.com',
+    from: process.env.EMAIL_FROM || process.env.SMTP_FROM || 'noreply@yourapp.com',
   },
 
   appUrl: process.env.APP_URL || 'http://localhost:3000',
