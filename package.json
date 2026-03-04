@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "test": "jest --forceExit",
     "test:watch": "jest --watch --forceExit",
+    "test:integration": "jest --config jest.integration.config.ts --forceExit --runInBand",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:studio": "prisma studio"

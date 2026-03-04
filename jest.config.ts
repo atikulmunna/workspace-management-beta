@@ -5,6 +5,7 @@ const config: Config = {
     testEnvironment: 'node',
     roots: ['<rootDir>/src'],
     testMatch: ['**/__tests__/**/*.test.ts'],
+    testPathIgnorePatterns: ['/node_modules/', '/__tests__/integration/'],
     // setupFiles runs before the test framework is installed — perfect for env vars
     setupFiles: ['<rootDir>/src/__tests__/setup.ts'],
     // clearMocks: clears call history only, does NOT reset implementations or Once queues.
