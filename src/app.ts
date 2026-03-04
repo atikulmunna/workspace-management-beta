@@ -18,15 +18,13 @@ import {
 
 const app = express()
 
-// ── Global Middleware ────────────────────────────────────────────────────────
+// ── Global Middleware ─────────────────────────────────────────────────────────
 app.use(helmet())
 app.use(cors())
 app.use(morgan(config.isDev ? 'dev' : 'combined'))
 app.use(express.json())
 
-// ── Health Check (REL-05) ─────────────────────────────────────────────────────
-// Verifies active DB connectivity so load balancers can route around unhealthy
-// instances. Returns 503 if the database is unreachable.
+// ── Health Check ──────────────────────────────────────────────────────────────
 app.get('/health', async (_req: Request, res: Response) => {
   try {
     await prisma.$queryRaw`SELECT 1`
@@ -36,14 +34,42 @@ app.get('/health', async (_req: Request, res: Response) => {
   }
 })
 
-// ── Routes ───────────────────────────────────────────────────────────────────
+// ── API Docs  (/docs  +  /docs/openapi.json) ──────────────────────────────────
+// Skipped in test environment to keep tests fast and side-effect-free.
+if (process.env.NODE_ENV !== 'test') {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const swaggerUi = require('swagger-ui-express') as typeof import('swagger-ui-express')
+  const { generateSpec } = require('./lib/openapi') as typeof import('./lib/openapi')
+
+  const spec = generateSpec()
+
+  // Relax Helmet's CSP only for the /docs route (Swagger UI needs inline scripts)
+  app.use('/docs', helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'", 'https:'],
+        imgSrc: ["'self'", 'data:', 'https:'],
+      },
+    },
+  }))
+
+  app.get('/docs/openapi.json', (_req, res) => res.json(spec))
+  app.use('/docs', swaggerUi.serve, swaggerUi.setup(spec, {
+    customSiteTitle: 'Workspace API Docs',
+    swaggerOptions: { persistAuthorization: true },
+  }))
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
 app.use('/auth', authRoutes)
 app.use('/workspaces', workspaceRoutes)
 app.use('/workspaces/:slug/members', memberRoutes)
 app.use('/workspaces/:slug/invitations', workspaceInvitationRouter)
 app.use('/invitations', invitationRouter)
 
-// ── Error Handler (must be last) ─────────────────────────────────────────────
+// ── Error Handler (must be last) ──────────────────────────────────────────────
 app.use(errorHandler)
 
 export default app
