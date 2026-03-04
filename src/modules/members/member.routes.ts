@@ -6,6 +6,7 @@ import { requireWorkspaceMember, requireRole } from '../../middleware/authorize'
 import { prisma } from '../../lib/prisma'
 import { auditLogOp, AuditAction } from '../../lib/audit'
 import { paginationSchema } from '../../lib/pagination'
+import { memberFilterSchema } from '../../lib/filters'
 import { ForbiddenError, NotFoundError } from '../../lib/errors'
 import { StatusCodes } from 'http-status-codes'
 
@@ -21,17 +22,22 @@ const updateRoleSchema = z.object({
 })
 
 /**
- * GET /workspaces/:slug/members — cursor-paginated member list.
+ * GET /workspaces/:slug/members — cursor-paginated + role filter.
+ * ?role=OWNER|ADMIN|MEMBER|VIEWER
  */
 router.get('/', async (req: Request, res: Response) => {
   const { limit, cursor } = paginationSchema.parse(req.query)
+  const { role } = memberFilterSchema.parse(req.query)
   const workspace = await prisma.workspace.findUnique({
     where: { slug: req.params.slug },
   })
   if (!workspace) throw new NotFoundError('Workspace')
 
   const members = await prisma.membership.findMany({
-    where: { workspaceId: workspace.id },
+    where: {
+      workspaceId: workspace.id,
+      ...(role ? { role } : {}),
+    },
     include: { user: { select: { id: true, name: true, email: true, avatarUrl: true } } },
     orderBy: { joinedAt: 'asc' },
     take: limit + 1,

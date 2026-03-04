@@ -4,9 +4,11 @@ import slugify from 'slugify'
 import { authenticate } from '../../middleware/authenticate'
 import { requireWorkspaceMember, requireRole } from '../../middleware/authorize'
 import { requireVerifiedEmail } from '../../middleware/verifyEmail'
+import { requireActiveWorkspace } from '../../middleware/requireActiveWorkspace'
 import { prisma } from '../../lib/prisma'
 import { auditLogOp, AuditAction } from '../../lib/audit'
 import { paginationSchema } from '../../lib/pagination'
+import { workspaceFilterSchema, auditLogFilterSchema } from '../../lib/filters'
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors'
 import { StatusCodes } from 'http-status-codes'
 
@@ -60,14 +62,28 @@ router.post('/', requireVerifiedEmail, async (req: Request, res: Response) => {
 
 /**
  * GET /workspaces
- * List workspaces the user belongs to (cursor-paginated).
+ * List workspaces the user belongs to (cursor-paginated + filtered).
+ * ?q=search             — case-insensitive match on name or slug
+ * ?includeArchived=true — include archived workspaces (default: excluded)
  */
 router.get('/', async (req: Request, res: Response) => {
   const { limit, cursor } = paginationSchema.parse(req.query)
+  const { q, includeArchived } = workspaceFilterSchema.parse(req.query)
   const user = req.currentUser!
 
   const memberships = await prisma.membership.findMany({
-    where: { userId: user.id },
+    where: {
+      userId: user.id,
+      workspace: {
+        ...(!includeArchived ? { archivedAt: null } : {}),
+        ...(q ? {
+          OR: [
+            { name: { contains: q, mode: 'insensitive' } },
+            { slug: { contains: q, mode: 'insensitive' } },
+          ]
+        } : {}),
+      },
+    },
     include: { workspace: true },
     orderBy: { joinedAt: 'asc' },
     take: limit + 1,
@@ -200,7 +216,10 @@ router.patch(
 )
 
 /**
- * GET /workspaces/:slug/audit-logs — cursor-paginated audit log. ADMIN+ only.
+ * GET /workspaces/:slug/audit-logs
+ * Cursor-paginated audit log with optional action and actor filters. ADMIN+ only.
+ * ?action=INVITE_SENT|MEMBER_ROLE_CHANGED|...  — filter by event type
+ * ?actorId=uuid   — filter by the user who triggered the event
  */
 router.get(
   '/:slug/audit-logs',
@@ -208,13 +227,18 @@ router.get(
   requireRole('ADMIN'),
   async (req: Request, res: Response) => {
     const { limit, cursor } = paginationSchema.parse(req.query)
+    const { action, actorId } = auditLogFilterSchema.parse(req.query)
     const workspace = await prisma.workspace.findUnique({
       where: { slug: req.params.slug },
     })
     if (!workspace) throw new NotFoundError('Workspace')
 
     const logs = await prisma.auditLog.findMany({
-      where: { workspaceId: workspace.id },
+      where: {
+        workspaceId: workspace.id,
+        ...(action ? { action } : {}),
+        ...(actorId ? { actorId } : {}),
+      },
       include: { actor: { select: { id: true, name: true, email: true } } },
       orderBy: { createdAt: 'desc' },
       take: limit + 1,
@@ -226,6 +250,59 @@ router.get(
     const nextCursor = hasNext ? page[page.length - 1]?.id : null
 
     res.json({ logs: page, nextCursor })
+  }
+)
+
+/**
+ * PATCH /workspaces/:slug/archive — OWNER only.
+ * Marks workspace as archived. All member write operations will return 403 after this.
+ * The workspace remains visible (read-only) to existing members.
+ */
+router.patch(
+  '/:slug/archive',
+  requireWorkspaceMember,
+  requireRole('OWNER'),
+  async (req: Request, res: Response) => {
+    const workspace = await prisma.workspace.findFirst({
+      where: { slug: req.params.slug },
+    })
+    if (!workspace) throw new NotFoundError('Workspace')
+    if (workspace.archivedAt) {
+      throw new ConflictError('Workspace is already archived')
+    }
+
+    const updated = await prisma.workspace.update({
+      where: { id: workspace.id },
+      data: { archivedAt: new Date() },
+    })
+
+    res.json({ workspace: updated, message: 'Workspace archived successfully' })
+  }
+)
+
+/**
+ * PATCH /workspaces/:slug/unarchive — OWNER only.
+ * Restores an archived workspace to active status.
+ */
+router.patch(
+  '/:slug/unarchive',
+  requireWorkspaceMember,
+  requireRole('OWNER'),
+  async (req: Request, res: Response) => {
+    const workspace = await prisma.workspace.findFirst({
+      where: { slug: req.params.slug },
+    })
+    if (!workspace) throw new NotFoundError('Workspace')
+    if (!workspace.archivedAt) {
+      throw new ConflictError('Workspace is not archived')
+    }
+
+    const updated = await prisma.workspace.update({
+      where: { id: workspace.id },
+      data: { archivedAt: null },
+    })
+
+    res.json({ workspace: updated, message: 'Workspace unarchived successfully' })
   }
 )
 

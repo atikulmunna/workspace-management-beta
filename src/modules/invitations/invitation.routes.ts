@@ -6,6 +6,7 @@ import { requireVerifiedEmail } from '../../middleware/verifyEmail'
 import { prisma } from '../../lib/prisma'
 import { auditLogOp, AuditAction } from '../../lib/audit'
 import { paginationSchema } from '../../lib/pagination'
+import { invitationFilterSchema } from '../../lib/filters'
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors'
 import { sendInvitationEmail } from '../../lib/email'
 import { StatusCodes } from 'http-status-codes'
@@ -26,18 +27,25 @@ workspaceInvitationRouter.use(authenticate)
 workspaceInvitationRouter.use(requireWorkspaceMember)
 
 /**
- * GET /workspaces/:slug/invitations — paginated list of pending invitations. ADMIN+.
+ * GET /workspaces/:slug/invitations — paginated + filtered. ADMIN+.
+ * ?email=bob@example.com   — filter by invitee email (partial match)
+ * ?status=PENDING|ACCEPTED|EXPIRED|REVOKED  — default: PENDING
  */
 workspaceInvitationRouter.get(
   '/',
   requireRole('ADMIN'),
   async (req: Request, res: Response) => {
     const { limit, cursor } = paginationSchema.parse(req.query)
+    const { email, status } = invitationFilterSchema.parse(req.query)
     const workspace = await prisma.workspace.findUnique({ where: { slug: req.params.slug } })
     if (!workspace) throw new NotFoundError('Workspace')
 
     const invitations = await prisma.invitation.findMany({
-      where: { workspaceId: workspace.id, status: 'PENDING' },
+      where: {
+        workspaceId: workspace.id,
+        status: status ?? 'PENDING',
+        ...(email ? { email: { contains: email, mode: 'insensitive' } } : {}),
+      },
       include: { invitedBy: { select: { id: true, name: true, email: true } } },
       orderBy: { createdAt: 'desc' },
       take: limit + 1,
