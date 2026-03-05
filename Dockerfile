@@ -1,52 +1,43 @@
-# ── Stage 1: deps ─────────────────────────────────────────────────────────────
-# Install only production dependencies and generate the Prisma client.
-FROM node:22-alpine AS deps
+# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+# Installs ALL deps and compiles TypeScript → dist/
+FROM node:22-alpine AS builder
+
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm ci --omit=dev
-
-COPY prisma ./prisma
-RUN npx prisma generate
-
-# ── Stage 2: build ────────────────────────────────────────────────────────────
-# Compile TypeScript using all dependencies (including devDependencies).
-FROM node:22-alpine AS build
-WORKDIR /app
-
+# Copy package files first for layer caching
 COPY package*.json ./
 RUN npm ci
 
+# Copy source + config
 COPY tsconfig.json ./
 COPY prisma ./prisma
-RUN npx prisma generate
-
 COPY src ./src
+
+# Generate Prisma client and compile TypeScript
+RUN npx prisma generate
 RUN npm run build
 
-# ── Stage 3: production image ─────────────────────────────────────────────────
-# Copy only compiled output + production node_modules. No source, no devDeps.
-FROM node:22-alpine AS runner
+# ── Stage 2: Production ───────────────────────────────────────────────────────
+# Lean runtime — no devDependencies, no source files
+FROM node:22-alpine AS production
+
 WORKDIR /app
 
-ENV NODE_ENV=production
+# Install only production dependencies
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# Copy compiled output and Prisma artifacts from builder
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
+COPY prisma ./prisma
 
 # Non-root user for security
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 USER appuser
 
-# Production dependencies + generated Prisma client
-COPY --from=deps --chown=appuser:appgroup /app/node_modules ./node_modules
-
-# Compiled JS
-COPY --from=build --chown=appuser:appgroup /app/dist ./dist
-
-# Prisma schema (needed at runtime for migrations)
-COPY --chown=appuser:appgroup prisma ./prisma
-
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- http://localhost:3000/health || exit 1
-
-CMD ["node", "dist/index.js"]
+# Run migrations then start (migrations are idempotent — safe on every deploy)
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]

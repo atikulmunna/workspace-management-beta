@@ -1,0 +1,50 @@
+# Local development docker-compose
+# Starts Postgres + the API service together.
+# Usage: docker-compose up
+#
+# Prerequisites:
+#   - Copy .env.example to .env and fill in JWT_SECRET, SMTP_PASS, etc.
+#   - DATABASE_URL will be overridden below for the local postgres container.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wsdev
+      POSTGRES_PASSWORD: wsdev
+      POSTGRES_DB: workspace_service
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U wsdev" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      target: builder # Use builder stage for hot-reload friendly dev
+    command: >
+      sh -c "npm run db:generate &&
+             npx prisma migrate dev --name init --skip-seed &&
+             npm run dev"
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://wsdev:wsdev@postgres:5432/workspace_service
+    env_file:
+      - .env # Picks up JWT_SECRET, SMTP_*, APP_URL etc.
+    volumes:
+      - ./src:/app/src # Hot-reload: src changes reflected immediately
+      - ./prisma:/app/prisma
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

@@ -1,32 +1,29 @@
-# Source & dev artifacts
+# ── Dependency artifacts ───────────────────────────────────────────────────
 node_modules/
-src/
-*.ts
-!dist/
 
-# Build tooling
-tsconfig.json
-jest.config.ts
-
-# Tests
-src/__tests__/
-
-# Environment
+# ── Environment files (never in image) ────────────────────────────────────
 .env
 .env.*
 
-# Git
-.git/
-.github/
-
-# Docs / internal
-*.md
-workspace-service-srs.md
-
-# OS
+# ── Development / build tooling ────────────────────────────────────────────
+*.log
+logs/
 .DS_Store
 Thumbs.db
 
-# Logs
-*.log
-logs/
+# ── Git / CI ───────────────────────────────────────────────────────────────
+.git/
+.github/
+
+# ── Test files ─────────────────────────────────────────────────────────────
+src/__tests__/
+jest.config.ts
+jest.integration.config.ts
+docker-compose*.yml
+
+# ── Documentation ──────────────────────────────────────────────────────────
+*.md
+workspace-service-srs.md
+
+# NOTE: src/, *.ts, tsconfig.json, and prisma/ are intentionally NOT excluded
+# so the builder stage can compile TypeScript and generate the Prisma client.

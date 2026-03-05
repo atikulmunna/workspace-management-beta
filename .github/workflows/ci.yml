@@ -7,15 +7,16 @@ on:
     branches: [main, master]
 
 jobs:
+  # ── Job 1: Type-check + Unit Tests ─────────────────────────────────────────
   test:
-    name: Type-check & Test
+    name: Type-check & Unit Tests
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -30,10 +31,77 @@ jobs:
       - name: Type-check
         run: npx tsc --noEmit
 
-      - name: Run tests
+      - name: Unit tests (mocked — no DB required)
         run: npm test
         env:
           NODE_ENV: test
           JWT_SECRET: ci-test-secret-that-is-long-enough-for-hs256
-          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci  # unused — all DB calls are mocked
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci   # mocked — never used
           APP_URL: http://localhost:3000
+
+  # ── Job 2: Integration Tests ────────────────────────────────────────────────
+  integration:
+    name: Integration Tests (real Postgres)
+    runs-on: ubuntu-latest
+    needs: test            # Run only if unit tests pass
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: wstest
+          POSTGRES_PASSWORD: wstest
+          POSTGRES_DB: workspace_service_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Run integration tests
+        run: npm run test:integration
+        env:
+          NODE_ENV: test
+          JWT_SECRET: ci-integration-secret-long-enough-for-hs256
+          DATABASE_URL: postgresql://wstest:wstest@localhost:5433/workspace_service_test
+          APP_URL: http://localhost:3000
+
+  # ── Job 3: Docker Build Check ───────────────────────────────────────────────
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: test            # Run only if unit tests pass
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (production stage)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: production
+          push: false          # Just validate the build — push happens in CD
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
