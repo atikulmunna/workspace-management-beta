@@ -1,23 +1,12 @@
-name: Deploy to Railway
+# Railway deployment is handled automatically via Railway's native GitHub source integration.
+# Every push to master triggers a deploy directly in Railway — no CLI, token, or jobs needed.
+#
+# One-time Railway dashboard setup:
+#   Project → Service → Settings → Source → GitHub → Branch: master → Auto Deploy: ON
+#
+# With that enabled, Railway watches this repo and deploys on every push to master.
+# The Dockerfile in the repo root is used for the build automatically.
 
-# Triggers on every push to master that passes CI
-on:
-  push:
-    branches: [master, main]
-
-jobs:
-  deploy:
-    name: Deploy
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
-      - name: Deploy to Railway
-        run: railway up --service workspace-management-beta --detach
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+name: "Railway deploys natively — see comments above"
+on: {}   # No triggers — Railway handles deployment directly
+jobs: {}
