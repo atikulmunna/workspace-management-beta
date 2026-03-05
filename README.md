@@ -7,7 +7,12 @@
 [![Prisma](https://img.shields.io/badge/Prisma-ORM-2D3748?logo=prisma)](https://www.prisma.io)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Neon-4169E1?logo=postgresql)](https://neon.tech)
 [![Jest](https://img.shields.io/badge/Tests-62%20passing-brightgreen?logo=jest)](https://jestjs.io)
-[![OpenAPI](https://img.shields.io/badge/OpenAPI-3.1-6BA539?logo=openapiinitiative)](http://localhost:3000/docs)
+[![OpenAPI](https://img.shields.io/badge/OpenAPI-3.1-6BA539?logo=openapiinitiative)](https://workspace-management-beta-production.up.railway.app/docs)
+
+**🔗 Live:**
+- [Interactive API Docs (Swagger UI)](https://workspace-management-beta-production.up.railway.app/docs)
+- [OpenAPI 3.1 JSON Spec](https://workspace-management-beta-production.up.railway.app/docs/openapi.json)
+- [Health Check](https://workspace-management-beta-production.up.railway.app/health)
 
 ---
 
