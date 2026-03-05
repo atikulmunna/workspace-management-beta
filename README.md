@@ -11,8 +11,8 @@
 
 **🔗 Live:**
 - [Interactive API Docs (Swagger UI)](https://workspace-management-beta-production.up.railway.app/docs)
-- [OpenAPI 3.1 JSON Spec](https://workspace-management-beta-production.up.railway.app/docs/openapi.json)
 - [Health Check](https://workspace-management-beta-production.up.railway.app/health)
+- [OpenAPI JSON](https://workspace-management-beta-production.up.railway.app/docs/openapi.json) *(import into Postman / Insomnia)*
 
 ---
 
