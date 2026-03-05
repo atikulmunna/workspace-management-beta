@@ -40,4 +40,4 @@ USER appuser
 EXPOSE 3000
 
 # Run migrations then start (migrations are idempotent — safe on every deploy)
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]
+CMD ["sh", "-c", "node_modules/.bin/prisma migrate deploy && node dist/index.js"]
