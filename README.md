@@ -13,6 +13,7 @@
 - [Interactive API Docs (Swagger UI)](https://workspace-management-beta-production.up.railway.app/docs)
 - [Health Check](https://workspace-management-beta-production.up.railway.app/health)
 - [OpenAPI JSON](https://workspace-management-beta-production.up.railway.app/docs/openapi.json) *(import into Postman / Insomnia)*
+- [📖 API Testing Guide — step-by-step for beginners](./docs/API_TESTING_GUIDE.md)
 
 ---
 
