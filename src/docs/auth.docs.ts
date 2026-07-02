@@ -38,9 +38,32 @@ registry.registerPath({
 // ── GET /auth/verify ──────────────────────────────────────────────────────────
 registry.registerPath({
     method: 'get', path: '/auth/verify', tags: ['Auth'],
+    summary: 'Validate a magic link (does NOT consume it)',
+    description: 'Side-effect-free: validates only the token FORMAT and echoes it back. It never touches the database or consumes the token, so email-scanner/link-preview prefetch (which issues GETs) cannot burn a single-use link. Complete sign-in by POSTing the token to `POST /auth/verify`.',
+    request: { query: z.object({ token: z.string().openapi({ description: 'The token from the magic link query string' }) }) },
+    responses: {
+        200: { description: 'Token is well-formed; submit it via POST to sign in', content: { 'application/json': { schema: z.object({ token: z.string(), message: z.string() }) } } },
+        401: unauthorizedResponse,
+        422: validationResponse,
+    },
+})
+
+// ── POST /auth/verify ─────────────────────────────────────────────────────────
+registry.registerPath({
+    method: 'post', path: '/auth/verify', tags: ['Auth'],
     summary: 'Consume a magic link and receive tokens',
-    description: 'Validates the one-time token from the email link. Sets `emailVerifiedAt` on first use. Returns a short-lived access token (15 min) and a rotating refresh token (30 days).',
-    request: { params: z.object({ token: z.string().openapi({ description: 'The token from the magic link query string' }) }) },
+    description: 'Consumes the one-time token (single-use). Sets `emailVerifiedAt` on first use. Returns a short-lived access token (15 min) and a rotating refresh token (30 days).',
+    request: {
+        body: {
+            content: {
+                'application/json': {
+                    schema: z.object({
+                        token: z.string().openapi({ description: 'The token from the magic link', example: 'a3f8d1b624c0e9...(256-bit hex)' }),
+                    })
+                }
+            }
+        },
+    },
     responses: {
         200: { description: 'Tokens issued', content: { 'application/json': { schema: tokenResponse } } },
         401: unauthorizedResponse,

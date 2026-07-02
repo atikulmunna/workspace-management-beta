@@ -11,7 +11,7 @@
 import request from 'supertest'
 import { PrismaClient } from '@prisma/client'
 import crypto from 'crypto'
-import bcrypt from 'bcrypt'
+import { hashToken } from '../../lib/jwt'
 import app from '../../app'
 
 const prisma = new PrismaClient()
@@ -32,7 +32,7 @@ async function loginAs(email: string, name = 'Test User') {
 
     // Create a raw magic-link token and store its hash
     const rawToken = crypto.randomBytes(32).toString('hex')
-    const tokenHash = await bcrypt.hash(rawToken, 10)
+    const tokenHash = hashToken(rawToken)
     await prisma.magicLinkToken.create({
         data: {
             userId: user.id,
@@ -41,8 +41,8 @@ async function loginAs(email: string, name = 'Test User') {
         },
     })
 
-    // Consume the token via the real endpoint
-    const res = await request(app).get(`/auth/verify?token=${rawToken}`)
+    // Consume the token via the real endpoint (POST — GET no longer consumes)
+    const res = await request(app).post('/auth/verify').send({ token: rawToken })
     if (res.status !== 200) {
         throw new Error(`Login failed for ${email}: ${res.status} ${JSON.stringify(res.body)}`)
     }
@@ -53,17 +53,17 @@ async function loginAs(email: string, name = 'Test User') {
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 describe('[INT] Auth', () => {
-    it('GET /auth/verify sets emailVerifiedAt on first use', async () => {
+    it('POST /auth/verify sets emailVerifiedAt on first use', async () => {
         const unverified = await prisma.user.create({
             data: { email: 'unver@int.test', name: 'Unver', emailVerifiedAt: null },
         })
         const raw = crypto.randomBytes(32).toString('hex')
-        const hash = await bcrypt.hash(raw, 10)
+        const hash = hashToken(raw)
         await prisma.magicLinkToken.create({
             data: { userId: unverified.id, tokenHash: hash, expiresAt: new Date(Date.now() + 900_000) },
         })
 
-        const res = await request(app).get(`/auth/verify?token=${raw}`)
+        const res = await request(app).post('/auth/verify').send({ token: raw })
         expect(res.status).toBe(200)
         expect(res.body.user.emailVerifiedAt).toBeTruthy()
     })

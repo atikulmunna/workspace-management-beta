@@ -38,4 +38,10 @@ export const config = {
   },
 
   appUrl: process.env.APP_URL || 'http://localhost:3000',
+
+  // Comma-separated allowlist of browser origins. Empty = reflect all (dev/demo).
+  corsOrigins: (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean),
 }

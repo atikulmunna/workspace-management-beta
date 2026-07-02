@@ -183,3 +183,52 @@ describe('DELETE /workspaces/:slug/members/:userId (remove member)', () => {
         expect(res.body.error.message).toMatch(/owner/)
     })
 })
+
+// ── Archived workspace guard (requireActiveWorkspace) ─────────────────────────
+
+describe('Archived workspace write-guard', () => {
+    const archived = { ...workspace, archivedAt: new Date() }
+
+    it('blocks role changes with 403 when the workspace is archived', async () => {
+        db.user.findUnique.mockResolvedValue(adminUser)
+        db.workspace.findFirst.mockResolvedValue(archived)
+        db.membership.findUnique.mockResolvedValueOnce(adminMem)
+
+        const res = await request(app)
+            .patch(`${BASE}/${targetUser.id}`)
+            .set('Authorization', `Bearer ${adminToken}`)
+            .send({ role: 'VIEWER' })
+
+        expect(res.status).toBe(403)
+        expect(res.body.error.code).toBe('WORKSPACE_ARCHIVED')
+        expect(res.body.error.message).toMatch(/archived/i)
+    })
+
+    it('blocks member removal with 403 when the workspace is archived', async () => {
+        db.user.findUnique.mockResolvedValue(adminUser)
+        db.workspace.findFirst.mockResolvedValue(archived)
+        db.membership.findUnique.mockResolvedValueOnce(adminMem)
+
+        const res = await request(app)
+            .delete(`${BASE}/${targetUser.id}`)
+            .set('Authorization', `Bearer ${adminToken}`)
+
+        expect(res.status).toBe(403)
+        expect(res.body.error.message).toMatch(/archived/i)
+    })
+
+    it('still allows reading the member list of an archived workspace', async () => {
+        db.user.findUnique.mockResolvedValue(memberUser)
+        db.workspace.findFirst.mockResolvedValue(archived)
+        db.membership.findUnique.mockResolvedValueOnce(memberMem)
+        db.workspace.findUnique.mockResolvedValue(archived)
+        db.membership.findMany.mockResolvedValue([{ ...memberMem, user: memberUser }])
+
+        const res = await request(app)
+            .get(BASE)
+            .set('Authorization', `Bearer ${memberToken}`)
+
+        expect(res.status).toBe(200)
+        expect(res.body.members).toHaveLength(1)
+    })
+})

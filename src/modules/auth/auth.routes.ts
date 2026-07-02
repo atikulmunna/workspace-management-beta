@@ -1,16 +1,13 @@
 import { Router, Request, Response } from 'express'
 import { z } from 'zod'
-import crypto from 'crypto'
-import bcrypt from 'bcrypt'
 import rateLimit from 'express-rate-limit'
 import { prisma } from '../../lib/prisma'
 import { sendMagicLinkEmail } from '../../lib/email'
 import {
   signToken,
-  generateRefreshToken,
-  hashRefreshToken,
-  compareRefreshToken,
-  isValidRefreshTokenFormat,
+  generateToken,
+  hashToken,
+  isValidTokenFormat,
 } from '../../lib/jwt'
 import { authenticate } from '../../middleware/authenticate'
 import { config } from '../../config'
@@ -18,11 +15,6 @@ import { ValidationError, UnauthorizedError, ConflictError } from '../../lib/err
 import { StatusCodes } from 'http-status-codes'
 
 const router = Router()
-
-const BCRYPT_ROUNDS = 10
-const TOKEN_BYTES = 32
-const TOKEN_HEX_LENGTH = TOKEN_BYTES * 2
-const VALID_TOKEN_RE = /^[0-9a-f]+$/
 
 const magicLinkLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -62,8 +54,8 @@ router.post('/magic-link', magicLinkLimiter, async (req: Request, res: Response)
     data: { usedAt: new Date() },
   })
 
-  const rawToken = crypto.randomBytes(TOKEN_BYTES).toString('hex')
-  const tokenHash = await bcrypt.hash(rawToken, BCRYPT_ROUNDS)
+  const rawToken = generateToken()
+  const tokenHash = hashToken(rawToken)
 
   await prisma.magicLinkToken.create({
     data: {
@@ -81,31 +73,43 @@ router.post('/magic-link', magicLinkLimiter, async (req: Request, res: Response)
 })
 
 // ── GET /auth/verify?token=xxx ────────────────────────────────────────────────
-// Sets emailVerifiedAt on first successful verification.
-router.get('/verify', verifyLimiter, async (req: Request, res: Response) => {
+// Side-effect-free: validates the token's FORMAT only and echoes it back. It
+// never touches the DB and never consumes the token, so email-scanner/link-preview
+// prefetch (which issues GETs) cannot burn a single-use sign-in link. The client
+// completes sign-in by POSTing the token to POST /auth/verify.
+router.get('/verify', verifyLimiter, (req: Request, res: Response) => {
   const rawToken = req.query.token as string | undefined
   if (!rawToken) throw new ValidationError('Missing token query parameter')
 
-  if (rawToken.length !== TOKEN_HEX_LENGTH || !VALID_TOKEN_RE.test(rawToken)) {
+  if (!isValidTokenFormat(rawToken)) {
     throw new UnauthorizedError('Invalid, expired, or already used sign-in link')
   }
 
-  const candidates = await prisma.magicLinkToken.findMany({
-    where: { usedAt: null, expiresAt: { gt: new Date() } },
-    include: { user: true },
-    orderBy: { createdAt: 'desc' },
-    take: 100,
+  res.status(StatusCodes.OK).json({
+    token: rawToken,
+    message: 'Submit this token via POST /auth/verify to complete sign-in.',
   })
+})
 
-  let matched: (typeof candidates)[0] | null = null
-  for (const candidate of candidates) {
-    if (await bcrypt.compare(rawToken, candidate.tokenHash)) {
-      matched = candidate
-      break
-    }
+// ── POST /auth/verify ─────────────────────────────────────────────────────────
+// Consumes the magic-link token (single-use) and issues the access/refresh pair.
+// Sets emailVerifiedAt on first successful verification.
+const verifyBodySchema = z.object({ token: z.string() })
+
+router.post('/verify', verifyLimiter, async (req: Request, res: Response) => {
+  const { token: rawToken } = verifyBodySchema.parse(req.body)
+
+  if (!isValidTokenFormat(rawToken)) {
+    throw new UnauthorizedError('Invalid, expired, or already used sign-in link')
   }
 
-  if (!matched) {
+  // O(1) indexed lookup on the deterministic hash — no row scan, no per-row hashing.
+  const matched = await prisma.magicLinkToken.findUnique({
+    where: { tokenHash: hashToken(rawToken) },
+    include: { user: true },
+  })
+
+  if (!matched || matched.usedAt || matched.expiresAt <= new Date()) {
     throw new UnauthorizedError('Invalid, expired, or already used sign-in link')
   }
 
@@ -131,8 +135,8 @@ router.get('/verify', verifyLimiter, async (req: Request, res: Response) => {
     data: { revokedAt: now },
   })
 
-  const rawRefresh = generateRefreshToken()
-  const refreshHash = await hashRefreshToken(rawRefresh)
+  const rawRefresh = generateToken()
+  const refreshHash = hashToken(rawRefresh)
   await prisma.refreshToken.create({
     data: {
       userId: matched.user.id,
@@ -162,31 +166,22 @@ const refreshSchema = z.object({ refreshToken: z.string() })
 router.post('/refresh', async (req: Request, res: Response) => {
   const { refreshToken: rawRefresh } = refreshSchema.parse(req.body)
 
-  if (!isValidRefreshTokenFormat(rawRefresh)) {
+  if (!isValidTokenFormat(rawRefresh)) {
     throw new UnauthorizedError('Invalid refresh token')
   }
 
-  const candidates = await prisma.refreshToken.findMany({
-    where: { revokedAt: null, expiresAt: { gt: new Date() } },
+  // O(1) indexed lookup on the deterministic hash.
+  const matched = await prisma.refreshToken.findUnique({
+    where: { tokenHash: hashToken(rawRefresh) },
     include: { user: true },
-    orderBy: { createdAt: 'desc' },
-    take: 100,
   })
 
-  let matched: (typeof candidates)[0] | null = null
-  for (const c of candidates) {
-    if (await compareRefreshToken(rawRefresh, c.tokenHash)) {
-      matched = c
-      break
-    }
-  }
-
-  if (!matched) {
+  if (!matched || matched.revokedAt || matched.expiresAt <= new Date()) {
     throw new UnauthorizedError('Invalid, expired, or revoked refresh token')
   }
 
-  const newRawRefresh = generateRefreshToken()
-  const newRefreshHash = await hashRefreshToken(newRawRefresh)
+  const newRawRefresh = generateToken()
+  const newRefreshHash = hashToken(newRawRefresh)
   const expiresAt = new Date(Date.now() + config.refreshToken.expiresInDays * 24 * 60 * 60 * 1000)
 
   await prisma.$transaction([
@@ -205,16 +200,13 @@ const logoutSchema = z.object({ refreshToken: z.string() })
 router.post('/logout', authenticate, async (req: Request, res: Response) => {
   const { refreshToken: rawRefresh } = logoutSchema.parse(req.body)
 
-  if (isValidRefreshTokenFormat(rawRefresh)) {
-    const candidates = await prisma.refreshToken.findMany({
-      where: { userId: req.currentUser!.id, revokedAt: null },
-      take: 5,
+  if (isValidTokenFormat(rawRefresh)) {
+    const token = await prisma.refreshToken.findUnique({
+      where: { tokenHash: hashToken(rawRefresh) },
     })
-    for (const c of candidates) {
-      if (await compareRefreshToken(rawRefresh, c.tokenHash)) {
-        await prisma.refreshToken.update({ where: { id: c.id }, data: { revokedAt: new Date() } })
-        break
-      }
+    // Only revoke a live token that actually belongs to the caller.
+    if (token && token.userId === req.currentUser!.id && !token.revokedAt) {
+      await prisma.refreshToken.update({ where: { id: token.id }, data: { revokedAt: new Date() } })
     }
   }
 

@@ -3,6 +3,7 @@ import express, { Request, Response } from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
 import morgan from 'morgan'
+import rateLimit from 'express-rate-limit'
 
 import { config } from './config'
 import { prisma } from './lib/prisma'
@@ -18,11 +19,28 @@ import {
 
 const app = express()
 
+// Behind Railway/other proxies, trust the first hop so req.ip reflects the real
+// client (X-Forwarded-For). Required for correct per-IP rate limiting.
+app.set('trust proxy', 1)
+
 // ── Global Middleware ─────────────────────────────────────────────────────────
 app.use(helmet())
-app.use(cors())
+// Restrict to the configured origin allowlist; if none is set, reflect all (dev/demo).
+app.use(cors(config.corsOrigins.length > 0 ? { origin: config.corsOrigins } : {}))
 app.use(morgan(config.isDev ? 'dev' : 'combined'))
 app.use(express.json())
+
+// Global rate limit — a coarse backstop on top of the stricter per-route auth
+// limiters. Uses in-memory state: fine for a single replica, but a shared store
+// (e.g. rate-limit-redis) is required if this service is scaled horizontally.
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: () => process.env.NODE_ENV === 'test',
+  message: { error: { code: 'TOO_MANY_REQUESTS', message: 'Too many requests. Please try again later.' } },
+})
 
 // ── Health Check ──────────────────────────────────────────────────────────────
 app.get('/health', async (_req: Request, res: Response) => {
@@ -63,6 +81,8 @@ if (process.env.NODE_ENV !== 'test') {
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
+// Rate limit the API routes (health check and docs above are intentionally exempt).
+app.use(globalLimiter)
 app.use('/auth', authRoutes)
 app.use('/workspaces', workspaceRoutes)
 app.use('/workspaces/:slug/members', memberRoutes)

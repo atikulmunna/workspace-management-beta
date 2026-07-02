@@ -8,13 +8,13 @@ jest.mock('../lib/prisma', () => ({
         user: { findUnique: jest.fn(), upsert: jest.fn(), update: jest.fn(), delete: jest.fn() },
         magicLinkToken: {
             create: jest.fn(),
-            findMany: jest.fn(),
+            findUnique: jest.fn(),
             update: jest.fn(),
             updateMany: jest.fn(),
         },
         refreshToken: {
             create: jest.fn(),
-            findMany: jest.fn(),
+            findUnique: jest.fn(),
             update: jest.fn(),
             updateMany: jest.fn(),
         },
@@ -25,17 +25,12 @@ jest.mock('../lib/prisma', () => ({
     },
 }))
 
-jest.mock('bcrypt', () => ({
-    hash: jest.fn().mockResolvedValue('$2b$10$mockedhash'),
-    compare: jest.fn(),
-}))
 jest.mock('../lib/email', () => ({
     sendMagicLinkEmail: jest.fn().mockResolvedValue(undefined),
     sendInvitationEmail: jest.fn().mockResolvedValue(undefined),
 }))
 
 import app from '../app'
-import bcrypt from 'bcrypt'
 import { prisma } from '../lib/prisma'
 
 const db = prisma as any  // typed access to mocked methods
@@ -92,23 +87,19 @@ describe('POST /auth/magic-link', () => {
 
 // ── GET /auth/verify ──────────────────────────────────────────────────────────
 
-describe('GET /auth/verify', () => {
+describe('GET /auth/verify (validate only — never consumes)', () => {
     const validRawToken = 'a'.repeat(64)  // 64 hex chars — passes format check
-    const tokenRecord = makeMagicLinkToken()
 
-    beforeEach(() => {
-        db.magicLinkToken.findMany.mockResolvedValue([tokenRecord])
-        db.magicLinkToken.update.mockResolvedValue({ ...tokenRecord, usedAt: new Date() })
-            ; (bcrypt.compare as jest.Mock).mockResolvedValue(true)
-    })
-
-    it('returns 200 with accessToken and user on a valid token', async () => {
+    it('returns 200 and echoes the token WITHOUT any DB side effects', async () => {
         const res = await request(app)
             .get(`/auth/verify?token=${validRawToken}`)
 
         expect(res.status).toBe(200)
-        expect(res.body).toHaveProperty('accessToken')
-        expect(res.body.user.email).toBe(testUser.email)
+        expect(res.body.token).toBe(validRawToken)
+        expect(res.body).not.toHaveProperty('accessToken')
+        // Scanner-prefetch safety: a GET must not touch or consume the token.
+        expect(db.magicLinkToken.findUnique).not.toHaveBeenCalled()
+        expect(db.magicLinkToken.update).not.toHaveBeenCalled()
     })
 
     it('returns 422 when token query param is missing', async () => {
@@ -117,28 +108,68 @@ describe('GET /auth/verify', () => {
         expect(res.status).toBe(422)
     })
 
-    it('returns 401 for a token with wrong length (format guard — zero DB queries)', async () => {
-        const res = await request(app)
-            .get('/auth/verify?token=tooshort')
+    it('returns 401 for a token with wrong length (format guard)', async () => {
+        const res = await request(app).get('/auth/verify?token=tooshort')
 
         expect(res.status).toBe(401)
-        expect(db.magicLinkToken.findMany).not.toHaveBeenCalled()
     })
 
     it('returns 401 for a token with non-hex characters (format guard)', async () => {
-        const nonHex = 'z'.repeat(64)
-        const res = await request(app)
-            .get(`/auth/verify?token=${nonHex}`)
+        const res = await request(app).get(`/auth/verify?token=${'z'.repeat(64)}`)
 
         expect(res.status).toBe(401)
-        expect(db.magicLinkToken.findMany).not.toHaveBeenCalled()
+    })
+})
+
+describe('POST /auth/verify (consume)', () => {
+    const validRawToken = 'a'.repeat(64)
+    const tokenRecord = makeMagicLinkToken()
+
+    beforeEach(() => {
+        db.magicLinkToken.findUnique.mockResolvedValue(tokenRecord)
+        db.magicLinkToken.update.mockResolvedValue({ ...tokenRecord, usedAt: new Date() })
+        db.refreshToken.updateMany.mockResolvedValue({ count: 0 })
+        db.refreshToken.create.mockResolvedValue({})
+    })
+
+    it('returns 200 with accessToken and user on a valid token', async () => {
+        const res = await request(app)
+            .post('/auth/verify')
+            .send({ token: validRawToken })
+
+        expect(res.status).toBe(200)
+        expect(res.body).toHaveProperty('accessToken')
+        expect(res.body.user.email).toBe(testUser.email)
+    })
+
+    it('returns 422 when token is missing from the body', async () => {
+        const res = await request(app).post('/auth/verify').send({})
+
+        expect(res.status).toBe(422)
+    })
+
+    it('returns 401 for a token with wrong length (format guard — zero DB queries)', async () => {
+        const res = await request(app).post('/auth/verify').send({ token: 'tooshort' })
+
+        expect(res.status).toBe(401)
+        expect(db.magicLinkToken.findUnique).not.toHaveBeenCalled()
     })
 
     it('returns 401 when no matching token hash is found', async () => {
-        ; (bcrypt.compare as jest.Mock).mockResolvedValue(false)
+        db.magicLinkToken.findUnique.mockResolvedValue(null)
 
-        const res = await request(app)
-            .get(`/auth/verify?token=${validRawToken}`)
+        const res = await request(app).post('/auth/verify').send({ token: validRawToken })
+
+        expect(res.status).toBe(401)
+    })
+
+    it('returns 401 for an expired token', async () => {
+        db.magicLinkToken.findUnique.mockResolvedValue({
+            ...tokenRecord,
+            expiresAt: new Date(Date.now() - 1000),
+        })
+
+        const res = await request(app).post('/auth/verify').send({ token: validRawToken })
 
         expect(res.status).toBe(401)
     })
@@ -245,15 +276,15 @@ describe('GET /auth/verify (emailVerifiedAt handling)', () => {
 
     it('sets emailVerifiedAt on a user who has never verified before', async () => {
         const magicToken = makeMagicLinkToken({ user: unverifiedUser })
-        db.magicLinkToken.findMany.mockResolvedValue([magicToken])
-            ; (bcrypt.compare as jest.Mock).mockResolvedValue(true)
+        db.magicLinkToken.findUnique.mockResolvedValue(magicToken)
         db.magicLinkToken.update.mockResolvedValue({})
         db.user.update.mockResolvedValue({ ...unverifiedUser, emailVerifiedAt: new Date() })
         db.refreshToken.updateMany.mockResolvedValue({ count: 0 })
         db.refreshToken.create.mockResolvedValue({})
 
         const res = await request(app)
-            .get('/auth/verify?token=' + 'a'.repeat(64))
+            .post('/auth/verify')
+            .send({ token: 'a'.repeat(64) })
 
         expect(res.status).toBe(200)
         expect(db.user.update).toHaveBeenCalledTimes(1)
@@ -262,14 +293,14 @@ describe('GET /auth/verify (emailVerifiedAt handling)', () => {
 
     it('does NOT update emailVerifiedAt when user is already verified', async () => {
         const magicToken = makeMagicLinkToken({ user: verifiedUser })
-        db.magicLinkToken.findMany.mockResolvedValue([magicToken])
-            ; (bcrypt.compare as jest.Mock).mockResolvedValue(true)
+        db.magicLinkToken.findUnique.mockResolvedValue(magicToken)
         db.magicLinkToken.update.mockResolvedValue({})
         db.refreshToken.updateMany.mockResolvedValue({ count: 0 })
         db.refreshToken.create.mockResolvedValue({})
 
         const res = await request(app)
-            .get('/auth/verify?token=' + 'a'.repeat(64))
+            .post('/auth/verify')
+            .send({ token: 'a'.repeat(64) })
 
         expect(res.status).toBe(200)
         // user.update should NOT be called because already verified

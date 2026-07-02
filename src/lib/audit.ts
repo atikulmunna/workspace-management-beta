@@ -13,14 +13,8 @@ interface AuditLogInput {
 }
 
 /**
- * Create an audit log entry (fire-and-forget outside of transactions).
- */
-export function auditLog(input: AuditLogInput) {
-    return prisma.auditLog.create({ data: input })
-}
-
-/**
- * Returns a Prisma create operation suitable for inclusion in $transaction([...]).
+ * Returns a Prisma create operation suitable for inclusion in $transaction([...]),
+ * so an audit entry is written atomically with the action it records.
  */
 export function auditLogOp(input: AuditLogInput) {
     return prisma.auditLog.create({ data: input })

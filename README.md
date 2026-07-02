@@ -6,7 +6,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript)](https://www.typescriptlang.org)
 [![Prisma](https://img.shields.io/badge/Prisma-ORM-2D3748?logo=prisma)](https://www.prisma.io)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Neon-4169E1?logo=postgresql)](https://neon.tech)
-[![Jest](https://img.shields.io/badge/Tests-62%20passing-brightgreen?logo=jest)](https://jestjs.io)
+[![Jest](https://img.shields.io/badge/Tests-76%20passing-brightgreen?logo=jest)](https://jestjs.io)
 [![OpenAPI](https://img.shields.io/badge/OpenAPI-3.1-6BA539?logo=openapiinitiative)](https://workspace-management-beta-production.up.railway.app/docs)
 
 **🔗 Live:**
@@ -23,7 +23,8 @@ The Workspace Management Service is a **backend microservice** that provides the
 
 ### Key capabilities
 
-- **Passwordless authentication** — magic links → bcrypt-hashed tokens → signed JWT + refresh token rotation
+- **Passwordless authentication** — magic links → SHA-256-hashed single-use tokens → signed JWT + refresh token rotation, with an O(1) indexed token lookup (no row scans)
+- **Prefetch-safe verification** — `GET /auth/verify` is side-effect-free; a separate `POST /auth/verify` consumes the token, so email-scanner prefetch can't burn a single-use link
 - **Email verification** — `emailVerifiedAt` set on first magic-link use; hard gate on sensitive writes
 - **Account deletion** — `DELETE /auth/me` with sole-owner guard and cascade cleanup
 - **Workspaces** — auto-slugged, full CRUD, cursor-paginated list with name/slug search
@@ -36,9 +37,11 @@ The Workspace Management Service is a **backend microservice** that provides the
 - **Search & filtering** — query params on every list endpoint (role, email, status, action, name search)
 - **OpenAPI 3.1 docs** — interactive Swagger UI at `/docs` + raw JSON spec at `/docs/openapi.json`
 - **Real SMTP email** — professionally styled HTML emails via Resend (or any SMTP provider)
-- **Rate limiting** on auth endpoints to resist brute-force and enumeration
+- **Rate limiting** — strict per-route limits on auth plus a global backstop; `trust proxy` set for correct per-IP limiting behind a reverse proxy
+- **CORS allowlist** — restrict browser origins via `CORS_ORIGINS` (reflects all in dev)
+- **Graceful shutdown** — `SIGTERM`/`SIGINT` drains in-flight requests and closes the DB pool cleanly (safe container redeploys)
 - **Live health check** with real DB connectivity probe (returns 503 on failure)
-- **62 unit tests** + **6 integration tests** (real Postgres via Docker)
+- **76 unit tests** + **6 integration tests** (real Postgres via Docker)
 
 ---
 
@@ -74,7 +77,8 @@ workspace-service/
 │   │   └── index.ts               # Env var loading with startup-time validation
 │   ├── lib/
 │   │   ├── prisma.ts              # Prisma client singleton
-│   │   ├── jwt.ts                 # signToken / verifyToken
+│   │   ├── jwt.ts                 # signToken / verifyToken / generateToken / hashToken (SHA-256)
+│   │   ├── cleanup.ts             # scheduled purge of spent magic-link + refresh tokens
 │   │   ├── email.ts               # sendMagicLinkEmail / sendInvitationEmail (Resend)
 │   │   ├── errors.ts              # AppError hierarchy
 │   │   ├── audit.ts               # auditLogOp() — writes to AuditLog table
@@ -190,30 +194,36 @@ Passwordless magic links — no passwords stored anywhere.
 ```
 1. POST /auth/magic-link  { email }
    → creates/finds user, generates 256-bit random token
-   → stores bcrypt hash of token in DB (raw never stored)
+   → stores SHA-256 hash of token in DB (raw never stored)
    → sends a styled sign-in email: APP_URL/auth/verify?token=<raw>
 
-2. GET /auth/verify?token=<raw>
-   → format guard (64 hex chars) → bcrypt.compare against DB hash
-   → marks token as used (single-use), sets emailVerifiedAt on first use
+2. GET /auth/verify?token=<raw>       (validate only — no side effects)
+   → format guard (64 hex chars), echoes the token back
+   → never touches the DB / never consumes the token
+     (so email-scanner prefetch cannot burn a single-use link)
+
+3. POST /auth/verify  { token }        (consume)
+   → O(1) indexed lookup on SHA-256(token) → single-use consume
+   → sets emailVerifiedAt on first use
    → returns { accessToken, refreshToken, user }
 
-3. All subsequent requests:
+4. All subsequent requests:
    Authorization: Bearer <accessToken>
    → JWT verify → DB syncUser → req.currentUser
 
-4. POST /auth/refresh  { refreshToken }
+5. POST /auth/refresh  { refreshToken }
    → rotates refresh token, issues new access token
 
-5. POST /auth/logout  { refreshToken }
+6. POST /auth/logout  { refreshToken }
    → revokes the refresh token
 ```
 
 **Security properties:**
 - Enumeration prevention — `POST /auth/magic-link` always returns `200`
 - Format guard — non-hex or wrong-length tokens rejected before any DB query
-- Single-use tokens — consumed on first successful verification
-- Bcrypt-only storage — DB breach cannot expose valid tokens
+- Prefetch-safe — `GET /auth/verify` has no side effects; only `POST /auth/verify` consumes
+- Single-use tokens — consumed on first successful `POST /auth/verify`
+- Hashed storage + O(1) lookup — only a SHA-256 hash is stored (irreversible); verification is a single indexed lookup, not a row scan
 - Rate limiting — 5 req/15min on magic-link, 10 req/15min on verify
 
 ---
@@ -230,7 +240,8 @@ Authorization: Bearer <JWT>
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `POST` | `/auth/magic-link` | — | Request a sign-in email |
-| `GET` | `/auth/verify?token=` | — | Verify token → JWT + refresh token |
+| `GET` | `/auth/verify?token=` | — | Validate token format only (no consume; prefetch-safe) |
+| `POST` | `/auth/verify` | — | Consume token → JWT + refresh token |
 | `POST` | `/auth/refresh` | — | Rotate refresh token |
 | `POST` | `/auth/logout` | ✓ | Revoke refresh token |
 | `GET` | `/auth/me` | ✓ | Get current user profile |
@@ -322,7 +333,7 @@ Authorization: Bearer <JWT>
 
 ## Workspace Archival
 
-Archived workspaces are **read-only**. All member write operations (update, invite, role change, etc.) return `403 WORKSPACE_ARCHIVED`. Archived workspaces are hidden from `GET /workspaces` by default.
+Archived workspaces are **read-only**. Member write operations (update, invite, role change, member removal, invite accept) return `403 WORKSPACE_ARCHIVED`, while reads and owner lifecycle actions (`delete`, `unarchive`) remain allowed. Archived workspaces are hidden from `GET /workspaces` by default.
 
 ```bash
 # Archive a workspace (OWNER only)
@@ -370,7 +381,8 @@ All errors return a consistent JSON shape:
 |---|---|---|
 | 400 | `BAD_REQUEST` | Malformed request |
 | 401 | `UNAUTHORIZED` | Missing / invalid / expired JWT |
-| 403 | `FORBIDDEN` | Insufficient role, unverified email, or archived workspace |
+| 403 | `FORBIDDEN` | Insufficient role or unverified email |
+| 403 | `WORKSPACE_ARCHIVED` | Write attempted on an archived workspace |
 | 404 | `NOT_FOUND` | Resource not found |
 | 409 | `CONFLICT` | Duplicate slug, existing member, pending invite, etc. |
 | 422 | `VALIDATION_ERROR` | Zod schema failed |
@@ -384,22 +396,23 @@ All errors return a consistent JSON shape:
 ### Unit Tests (mocked — no external services needed)
 
 ```bash
-npm test              # 62 tests across 4 suites
+npm test              # 76 tests across 5 suites
 npm run test:watch    # TDD watch mode
 ```
 
 ```
-Test Suites: 4 passed, 4 total
-Tests:       62 passed, 62 total
-Time:        ~3s
+Test Suites: 5 passed, 5 total
+Tests:       76 passed, 76 total
+Time:        ~4s
 ```
 
 | Suite | Tests | Coverage |
 |---|---|---|
-| `auth.routes` | 20 | Magic link, verify (emailVerifiedAt, format guard), /me GET/PATCH/DELETE, refresh, logout |
-| `workspaces.routes` | 19 | CRUD, slug conflict, RBAC, enumeration guard, transfer-owner, email gate, pagination |
-| `members.routes` | 11 | List, role update (MEM-05/06), remove (MEM-10), self-leave |
-| `invitations.routes` | 12 | Send, duplicate/member guards, accept (INV-09/11/12), revoke, email gate |
+| `auth.routes` | 27 | Magic link, GET verify (validate-only/no-consume), POST verify (consume, emailVerifiedAt, expiry), /me GET/PATCH/DELETE, refresh, logout |
+| `workspaces.routes` | 24 | CRUD, slug conflict, RBAC, enumeration guard, transfer-owner, archive write-guard, Prisma P2002/P2025 mapping, email gate, pagination |
+| `members.routes` | 12 | List, role update (MEM-05/06), remove (MEM-10), self-leave, archived-workspace guard |
+| `invitations.routes` | 11 | Send, duplicate/member guards, accept (INV-09/11/12), revoke, archived-workspace guard, email gate |
+| `cleanup` | 2 | Sweeps expired/used magic-link + expired/revoked refresh tokens |
 
 ### Integration Tests (real Postgres via Docker)
 
@@ -445,6 +458,7 @@ The spec is generated from Zod schemas via `@asteasolutions/zod-to-openapi` — 
 | `SMTP_PASS` | Yes | — | SMTP password / API key |
 | `EMAIL_FROM` | Yes | — | Sender address for outgoing emails |
 | `APP_URL` | Yes | — | Public base URL (used in email links) |
+| `CORS_ORIGINS` | No | *(all)* | Comma-separated browser origin allowlist; empty reflects all (dev only) |
 
 ---
 

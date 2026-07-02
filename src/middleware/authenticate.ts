@@ -17,8 +17,8 @@ export const validateToken = (req: Request, _res: Response, next: NextFunction) 
 
     const payload = jwt.verify(token, config.jwt.secret) as JwtPayload
 
-    // Attach raw payload so syncUser can read it
-    ;(req as any)._jwtPayload = payload
+    // Attach verified payload so syncUser can read it
+    req.jwtPayload = payload
 
     next()
   } catch (err) {
@@ -33,7 +33,7 @@ export const validateToken = (req: Request, _res: Response, next: NextFunction) 
 // Step 2 — Load user from DB using the JWT sub (our User.id)
 export const syncUser = async (req: Request, _res: Response, next: NextFunction) => {
   try {
-    const payload = (req as any)._jwtPayload as JwtPayload
+    const payload = req.jwtPayload
     if (!payload?.sub) throw new UnauthorizedError()
 
     const user = await prisma.user.findUnique({ where: { id: payload.sub } })

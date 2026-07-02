@@ -125,6 +125,7 @@ router.get('/:slug', requireWorkspaceMember, async (req: Request, res: Response)
 router.patch(
   '/:slug',
   requireWorkspaceMember,
+  requireActiveWorkspace,
   requireRole('ADMIN'),
   async (req: Request, res: Response) => {
     const body = updateWorkspaceSchema.parse(req.body)
@@ -164,6 +165,7 @@ const transferOwnerSchema = z.object({
 router.patch(
   '/:slug/transfer-owner',
   requireWorkspaceMember,
+  requireActiveWorkspace,
   requireRole('OWNER'),
   async (req: Request, res: Response) => {
     const { userId: targetUserId } = transferOwnerSchema.parse(req.body)
