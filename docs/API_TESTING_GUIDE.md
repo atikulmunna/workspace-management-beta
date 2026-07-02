@@ -52,11 +52,34 @@ The API uses **passwordless authentication** — no password, just your email.
 
 ## Step 2 — Verify the Link and Get Your Token
 
+Verification is a **two-step** process. Clicking the email link only *validates* the token — it does **not** log you in or consume it. This is on purpose: some email systems automatically pre-open links (to scan them), which would otherwise waste your single-use link before you ever click it. You complete sign-in with a separate `POST`.
+
+**2a. Get your token from the email link**
+
 1. Click the link in the email — it looks like:
    ```
    https://workspace-management-beta-production.up.railway.app/auth/verify?token=abc123...
    ```
-2. Your browser will open a response like this:
+2. Your browser opens a small response confirming the token is valid:
+   ```json
+   {
+     "token": "abc123...",
+     "message": "Submit this token via POST /auth/verify to complete sign-in."
+   }
+   ```
+3. **Copy the `token` value.** (It's also the `token=` part of the link's URL — either works.)
+
+**2b. Exchange the token for your access token**
+
+1. In Swagger UI, find **Auth** → **`POST /auth/verify`**
+2. Click **"Try it out"**
+3. Paste your token into the body:
+   ```json
+   {
+     "token": "abc123..."
+   }
+   ```
+4. Click **Execute** — you'll get:
    ```json
    {
      "accessToken": "eyJhbGciOiJIUzI1NiJ9...",
@@ -68,9 +91,11 @@ The API uses **passwordless authentication** — no password, just your email.
      }
    }
    ```
-3. **Copy the `accessToken` value** — you'll need it in the next step
+5. **Copy the `accessToken` value** — you'll need it in the next step
 
-> **Tip:** The access token expires in 15 minutes. If it expires, use `POST /auth/refresh` with your `refreshToken` to get a new pair without re-clicking an email link.
+> **Note:** The token is single-use and is consumed by this `POST` — the first successful call also verifies your email. A second `POST` with the same token returns `401`.
+>
+> **Tip:** The access token expires in 15 minutes. If it expires, use `POST /auth/refresh` with your `refreshToken` to get a new pair without re-requesting an email link.
 
 ---
 
@@ -108,7 +133,7 @@ Verify authentication is working:
 
 ## Step 5 — Create a Workspace
 
-> ⚠️ **Email verification required.** Your email must be verified to create a workspace. It is automatically verified the first time you click a magic link.
+> ⚠️ **Email verification required.** Your email must be verified to create a workspace. It is automatically verified the first time you complete sign-in via `POST /auth/verify` (Step 2b).
 
 1. Find **Workspaces** → **`POST /workspaces`**
 2. Click **"Try it out"**
@@ -189,7 +214,7 @@ Every important action in a workspace is recorded.
 | `403` | `WORKSPACE_ARCHIVED` | Workspace has been archived — read-only | Contact the workspace owner to unarchive |
 | `409` | `CONFLICT` | Duplicate — e.g. invitation already exists, slug taken | Change the value causing the conflict |
 | `422` | `VALIDATION_ERROR` | Request body has missing or invalid fields | Check the `issues` array in the response for field-by-field details |
-| `429` | `RATE_LIMIT` | Too many magic link requests (max 5 per 15 min) | Wait 15 minutes before requesting another link |
+| `429` | `TOO_MANY_REQUESTS` | Too many requests (e.g. max 5 magic-link requests per 15 min) | Wait 15 minutes before trying again |
 
 ---
 
