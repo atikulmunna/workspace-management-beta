@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { Role } from '@prisma/client'
 import { authenticate } from '../../middleware/authenticate'
 import { requireWorkspaceMember, requireRole } from '../../middleware/authorize'
+import { requireActiveWorkspace } from '../../middleware/requireActiveWorkspace'
 import { prisma } from '../../lib/prisma'
 import { auditLogOp, AuditAction } from '../../lib/audit'
 import { paginationSchema } from '../../lib/pagination'
@@ -57,6 +58,7 @@ router.get('/', async (req: Request, res: Response) => {
  */
 router.patch(
   '/:userId',
+  requireActiveWorkspace,
   requireRole('ADMIN'),
   async (req: Request, res: Response) => {
     const { role } = updateRoleSchema.parse(req.body)
@@ -106,6 +108,7 @@ router.patch(
  */
 router.delete(
   '/:userId',
+  requireActiveWorkspace,
   async (req: Request, res: Response) => {
     const { userId } = req.params
     const currentUser = req.currentUser!

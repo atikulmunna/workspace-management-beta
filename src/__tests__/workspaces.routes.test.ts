@@ -1,4 +1,5 @@
 import request from 'supertest'
+import { Prisma } from '@prisma/client'
 import { makeUser, makeWorkspace, makeMembership, makeToken } from './helpers'
 
 jest.mock('../lib/prisma', () => ({
@@ -72,6 +73,26 @@ describe('POST /workspaces', () => {
             .send({ name: 'X' })
 
         expect(res.status).toBe(422)
+    })
+
+    it('maps a Prisma P2002 unique-violation race to 409', async () => {
+        // findUnique says the slug is free, but create loses the race and throws P2002.
+        db.workspace.findUnique.mockResolvedValue(null)
+        db.workspace.create.mockRejectedValue(
+            new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+                code: 'P2002',
+                clientVersion: 'test',
+                meta: { target: ['slug'] },
+            })
+        )
+
+        const res = await request(app)
+            .post('/workspaces')
+            .set('Authorization', `Bearer ${ownerToken}`)
+            .send({ name: 'Acme Corp' })
+
+        expect(res.status).toBe(409)
+        expect(res.body.error.code).toBe('CONFLICT')
     })
 
     it('returns 401 with no auth header', async () => {
@@ -162,6 +183,23 @@ describe('PATCH /workspaces/:slug', () => {
 
         expect(res.status).toBe(403)
     })
+
+    it('returns 403 (archived guard) when updating an archived workspace', async () => {
+        const adminUser = makeUser({ id: 'admin-id', email: 'admin@example.com' })
+        const adminMem = makeMembership({ userId: adminUser.id, role: 'ADMIN' })
+        db.user.findUnique.mockResolvedValue(adminUser)
+        db.workspace.findFirst.mockResolvedValue({ ...workspace, archivedAt: new Date() })
+        db.membership.findUnique.mockResolvedValue(adminMem)
+
+        const res = await request(app)
+            .patch('/workspaces/acme-corp')
+            .set('Authorization', `Bearer ${makeToken(adminUser.id, adminUser.email)}`)
+            .send({ name: 'Renamed' })
+
+        expect(res.status).toBe(403)
+        expect(res.body.error.message).toMatch(/archived/i)
+        expect(db.workspace.update).not.toHaveBeenCalled()
+    })
 })
 
 // ── DELETE /workspaces/:slug ──────────────────────────────────────────────────
@@ -176,6 +214,23 @@ describe('DELETE /workspaces/:slug', () => {
             .set('Authorization', `Bearer ${ownerToken}`)
 
         expect(res.status).toBe(204)
+    })
+
+    it('maps a Prisma P2025 record-not-found on delete to 404', async () => {
+        authAsOwner()
+        db.workspace.delete.mockRejectedValue(
+            new Prisma.PrismaClientKnownRequestError('Record to delete does not exist', {
+                code: 'P2025',
+                clientVersion: 'test',
+            })
+        )
+
+        const res = await request(app)
+            .delete('/workspaces/acme-corp')
+            .set('Authorization', `Bearer ${ownerToken}`)
+
+        expect(res.status).toBe(404)
+        expect(res.body.error.code).toBe('NOT_FOUND')
     })
 
     it('returns 403 when an ADMIN tries to delete', async () => {

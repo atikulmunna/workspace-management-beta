@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express'
+import { StatusCodes } from 'http-status-codes'
 import { prisma } from '../lib/prisma'
-import { ForbiddenError, NotFoundError } from '../lib/errors'
+import { AppError, NotFoundError } from '../lib/errors'
 
 /**
  * requireActiveWorkspace — blocks any write operations on archived workspaces.
@@ -21,9 +22,11 @@ export async function requireActiveWorkspace(
     if (!workspace) throw new NotFoundError('Workspace')
 
     if (workspace.archivedAt) {
-        throw new ForbiddenError(
+        throw new AppError(
             'This workspace is archived and does not accept write operations. ' +
-            'Unarchive it first via PATCH /workspaces/:slug/unarchive.'
+            'Unarchive it first via PATCH /workspaces/:slug/unarchive.',
+            StatusCodes.FORBIDDEN,
+            'WORKSPACE_ARCHIVED'
         )
     }
 

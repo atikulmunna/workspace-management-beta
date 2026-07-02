@@ -2,12 +2,13 @@ import { Router, Request, Response } from 'express'
 import { z } from 'zod'
 import { authenticate } from '../../middleware/authenticate'
 import { requireWorkspaceMember, requireRole } from '../../middleware/authorize'
+import { requireActiveWorkspace } from '../../middleware/requireActiveWorkspace'
 import { requireVerifiedEmail } from '../../middleware/verifyEmail'
 import { prisma } from '../../lib/prisma'
 import { auditLogOp, AuditAction } from '../../lib/audit'
 import { paginationSchema } from '../../lib/pagination'
 import { invitationFilterSchema } from '../../lib/filters'
-import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors'
+import { AppError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors'
 import { sendInvitationEmail } from '../../lib/email'
 import { StatusCodes } from 'http-status-codes'
 
@@ -66,6 +67,7 @@ workspaceInvitationRouter.get(
  */
 workspaceInvitationRouter.post(
   '/',
+  requireActiveWorkspace,
   requireRole('ADMIN'),
   requireVerifiedEmail,
   async (req: Request, res: Response) => {
@@ -125,6 +127,7 @@ workspaceInvitationRouter.post(
  */
 workspaceInvitationRouter.delete(
   '/:invitationId',
+  requireActiveWorkspace,
   requireRole('ADMIN'),
   async (req: Request, res: Response) => {
     const { invitationId } = req.params
@@ -178,6 +181,13 @@ invitationRouter.post('/:id/accept', authenticate, async (req: Request, res: Res
   }
   if (invitation.email !== user.email) {
     throw new ForbiddenError('This invitation was not sent to your email address')
+  }
+  if (invitation.workspace.archivedAt) {
+    throw new AppError(
+      'This workspace is archived and is not accepting new members',
+      StatusCodes.FORBIDDEN,
+      'WORKSPACE_ARCHIVED'
+    )
   }
 
   const [membership] = await prisma.$transaction([

@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken'
+import crypto from 'crypto'
 import { config } from '../config'
 import { JwtPayload } from '../types'
 
@@ -15,28 +16,28 @@ export function verifyToken(token: string): JwtPayload {
   return jwt.verify(token, config.jwt.secret) as JwtPayload
 }
 
-// ── Refresh token (long-lived — 30d) ──────────────────────────────────────────
-// Refresh tokens are NOT JWTs. They are 256-bit random hex strings, just like
-// magic-link tokens. We store only the bcrypt hash in the DB.
-// The raw token is returned to the client once and never stored plain.
-import crypto from 'crypto'
-import bcrypt from 'bcrypt'
+// ── Opaque tokens (magic-link + refresh) ────────────────────────────────────────
+// Neither is a JWT. They are 256-bit random hex strings. We store only a
+// deterministic SHA-256 hash in the DB and return the raw token to the client once.
+//
+// Why SHA-256 and not bcrypt: bcrypt is deliberately slow to protect *low-entropy*
+// passwords against brute force. These tokens are already 256 bits of CSPRNG output,
+// so brute force is infeasible regardless of hash speed. A fast deterministic hash
+// lets us do a single indexed `findUnique({ where: { tokenHash } })` lookup — O(1) —
+// instead of scanning rows and bcrypt-comparing each (O(N), a DoS vector). A DB leak
+// still exposes only the hash, which is not reversible to a usable token.
 
-const REFRESH_TOKEN_BYTES = 32
-const REFRESH_TOKEN_RE = /^[0-9a-f]+$/
+const TOKEN_BYTES = 32
+const TOKEN_HEX_RE = /^[0-9a-f]+$/
 
-export function generateRefreshToken(): string {
-  return crypto.randomBytes(REFRESH_TOKEN_BYTES).toString('hex')
+export function generateToken(): string {
+  return crypto.randomBytes(TOKEN_BYTES).toString('hex')
 }
 
-export function isValidRefreshTokenFormat(raw: string): boolean {
-  return raw.length === REFRESH_TOKEN_BYTES * 2 && REFRESH_TOKEN_RE.test(raw)
+export function hashToken(raw: string): string {
+  return crypto.createHash('sha256').update(raw).digest('hex')
 }
 
-export async function hashRefreshToken(raw: string): Promise<string> {
-  return bcrypt.hash(raw, 10)
-}
-
-export async function compareRefreshToken(raw: string, hash: string): Promise<boolean> {
-  return bcrypt.compare(raw, hash)
+export function isValidTokenFormat(raw: string): boolean {
+  return raw.length === TOKEN_BYTES * 2 && TOKEN_HEX_RE.test(raw)
 }

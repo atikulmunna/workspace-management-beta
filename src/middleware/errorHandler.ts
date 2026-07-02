@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express'
 import { ZodError } from 'zod'
+import { Prisma } from '@prisma/client'
 import { AppError } from '../lib/errors'
 import { config } from '../config'
 import { StatusCodes } from 'http-status-codes'
@@ -24,11 +25,21 @@ export const errorHandler = (
     })
   }
 
-  // JWT errors from express-jwt
-  if (err.name === 'UnauthorizedError') {
-    return res.status(StatusCodes.UNAUTHORIZED).json({
-      error: { code: 'UNAUTHORIZED', message: 'Invalid or missing token' },
-    })
+  // Known Prisma errors — map to sensible HTTP codes instead of a generic 500.
+  // Guards against races that slip past application-level checks
+  // (e.g. a duplicate slug created between our findUnique and create).
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2002') {
+      return res.status(StatusCodes.CONFLICT).json({
+        error: { code: 'CONFLICT', message: 'A record with these details already exists' },
+      })
+    }
+    if (err.code === 'P2025') {
+      return res.status(StatusCodes.NOT_FOUND).json({
+        error: { code: 'NOT_FOUND', message: 'The requested record was not found' },
+      })
+    }
+    // Any other known Prisma error falls through to the generic 500 below.
   }
 
   // Our custom app errors

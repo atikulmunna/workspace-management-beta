@@ -72,6 +72,20 @@ describe('POST /workspaces/:slug/invitations', () => {
         expect(res.body.invitation.email).toBe('bob@example.com')
     })
 
+    it('returns 403 (archived guard) when inviting into an archived workspace', async () => {
+        db.user.findUnique.mockResolvedValue(adminUser)
+        db.workspace.findFirst.mockResolvedValue({ ...workspace, archivedAt: new Date() })
+
+        const res = await request(app)
+            .post(WS_BASE)
+            .set('Authorization', `Bearer ${adminToken}`)
+            .send({ email: 'bob@example.com', role: 'MEMBER' })
+
+        expect(res.status).toBe(403)
+        expect(res.body.error.message).toMatch(/archived/i)
+        expect(db.$transaction).not.toHaveBeenCalled()
+    })
+
     it('INV-02: returns 409 when invitee is already a workspace member', async () => {
         const existingMember = { ...makeUser({ id: 'existing-id' }), memberships: [adminMem] }
         db.user.findUnique.mockImplementation(({ where }: any) =>
@@ -171,6 +185,23 @@ describe('POST /invitations/:id/accept', () => {
             .set('Authorization', `Bearer ${makeToken(wrongUser.id, wrongUser.email)}`)
 
         expect(res.status).toBe(403)
+    })
+
+    it('returns 403 when accepting an invitation to an archived workspace', async () => {
+        db.user.findUnique.mockResolvedValue(invitee)
+        db.invitation.findUnique.mockResolvedValue({
+            ...invitation,
+            email: invitee.email,
+            workspace: { ...workspace, archivedAt: new Date() },
+        })
+
+        const res = await request(app)
+            .post(`/invitations/${invitation.id}/accept`)
+            .set('Authorization', `Bearer ${inviteeToken}`)
+
+        expect(res.status).toBe(403)
+        expect(res.body.error.message).toMatch(/archived/i)
+        expect(db.$transaction).not.toHaveBeenCalled()
     })
 
     it('INV-11: returns 403 for an expired invitation and marks it EXPIRED', async () => {

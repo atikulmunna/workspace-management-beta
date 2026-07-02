@@ -26,7 +26,7 @@ model User {
 model MagicLinkToken {
   id        String    @id @default(uuid())
   userId    String
-  tokenHash String    @unique   // bcrypt hash of the raw token — DB leak safe
+  tokenHash String    @unique   // SHA-256 hash of the raw token — DB leak safe, O(1) lookup
   expiresAt DateTime
   usedAt    DateTime?           // null = unused, timestamp = consumed
   createdAt DateTime  @default(now())
@@ -96,7 +96,7 @@ enum InvitationStatus {
 model RefreshToken {
   id        String    @id @default(uuid())
   userId    String
-  tokenHash String    @unique   // bcrypt hash — DB breach cannot expose raw tokens
+  tokenHash String    @unique   // SHA-256 hash — DB breach cannot expose raw tokens, O(1) lookup
   expiresAt DateTime
   revokedAt DateTime?           // null = active; timestamp = consumed/rotated
   createdAt DateTime  @default(now())
